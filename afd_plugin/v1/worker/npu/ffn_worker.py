@@ -23,6 +23,7 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.megamoe import MegaMoESplitAFDConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -254,6 +255,12 @@ class AFDNPUFFNWorker(NPUWorker):
             connector if isinstance(connector, CAMAsyncAFDConnector) else None
         )
         thread = self._ffn_thread
+        # MegaMoE polls the control store without blocking on an idle DP.
+        # Join before closing its registered window on the shutdown thread.
+        if isinstance(connector, MegaMoESplitAFDConnector) and thread:
+            thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise RuntimeError("MegaMoE FFN still owns the communication window")
         if cam_connector is not None and thread is not None:
             thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
             if thread.is_alive():

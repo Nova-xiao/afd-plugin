@@ -39,6 +39,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.connectors.npu.megamoe import MegaMoESplitAFDConnector
 from afd_plugin.distributed.afd_process_group import ProcessGroupRendezvousContext
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
@@ -151,7 +152,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         return parse_afd_config(vllm_config, expected_role="ffn")
 
     def initialize_afd_connector(self) -> None:
-        if self._layered_executor is None:
+        if isinstance(self.connector, MegaMoESplitAFDConnector):
+            if self.connector.is_initialized:
+                return
+            self.connector.prepare_layers(self.model.model.layers)
+        elif self._layered_executor is None:
             self._initialize_layered_executor()
         self.connector.init_afd_connector()
 
@@ -251,6 +256,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "AFD connector",
             )
         step_afd_npu_profiler(self.prof)
+        if isinstance(self.connector, MegaMoESplitAFDConnector):
+            self.connector.execute_next_experts()
+            return
         if self._async_cam_ffn_graph_enabled:
             connector = cast(CAMAsyncAFDConnector, self.connector)
             graph = self._async_cam_ffn_graph
@@ -284,7 +292,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def prepare_async_cam_ffn_startup(self) -> FFNStartupPlan:
         """Prepare the executor and select eager or one FULL graph."""
-        if self._layered_executor is None:
+        if isinstance(self.connector, MegaMoESplitAFDConnector):
+            if self.connector.is_initialized:
+                return
+            self.connector.prepare_layers(self.model.model.layers)
+        elif self._layered_executor is None:
             self._initialize_layered_executor()
         if not self._async_cam_ffn_graph_enabled:
             return FFNStartupPlan(use_graph=False)

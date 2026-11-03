@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGAMOE_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -46,6 +47,12 @@ def fail_if_unsupported_npu_afd_features(
         afd_config.connector,
         vllm_config,
     )
+
+    if afd_config.connector == MEGAMOE_CONNECTOR:
+        from afd_plugin.connectors.npu.megamoe import validate_megamoe_config
+
+        validate_megamoe_config(vllm_config, afd_config)
+        return
 
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
