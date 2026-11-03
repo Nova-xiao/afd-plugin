@@ -36,7 +36,7 @@ from afd_plugin.compat.patches.npu.mrv2_ubatching import (
     use_async_cam_dbo_dispatch,
     use_npu_ubatch_factory,
 )
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import MEGAMOE_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
@@ -246,7 +246,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
             # Attention runner lifecycle.
-            if connector.control_plane is None and not self.afd_config.async_dp:
+            if (
+                connector.control_plane is None
+                and not self.afd_config.async_dp
+                and self.afd_config.connector != MEGAMOE_CONNECTOR
+            ):
                 raise RuntimeError(
                     "AFD ModelRunnerV2 requires a control-plane-driven connector",
                 )

@@ -24,7 +24,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -385,7 +385,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
             moe_config = config
-            if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR):
                 moe_config = copy(config)
                 # HF validates this public field as int, but pinned native
                 # MoE uses only None to omit shared construction (0 builds a
@@ -700,7 +700,8 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             weights,
             role=self.afd_role,
             attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+            attention_shared_experts=self.afd_config.connector
+            in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR),
         )
         loaded = super().load_weights(role_weights)
         return loaded

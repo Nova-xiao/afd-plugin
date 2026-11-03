@@ -86,6 +86,11 @@ class AFDConnectorFactory:
 
 
 AFDConnectorFactory.register_connector(
+    "MegaMoESplitAFDConnector",
+    "afd_plugin.connectors.npu.megamoe",
+    "MegaMoESplitAFDConnector",
+)
+AFDConnectorFactory.register_connector(
     "P2pNcclAFDConnector",
     "afd_plugin.connectors.gpu.p2p",
     "P2pNcclAFDConnector",

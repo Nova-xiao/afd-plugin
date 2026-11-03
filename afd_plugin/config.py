@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
+MEGAMOE_CONNECTOR: Final[str] = "MegaMoESplitAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
 DEEPEP_M2N_CONNECTOR: Final[str] = "DeepEPM2NAFDConnector"
 DEEPEP_M2N_CONNECTORS: Final[tuple[str, ...]] = (DEEPEP_M2N_CONNECTOR,)
@@ -29,6 +30,7 @@ SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     DEEPEP_M2N_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGAMOE_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
 

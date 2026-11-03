@@ -169,6 +169,24 @@ MRV2_BACKENDS = {
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_megamoe_eager_v2_role(mrv2_config, role):
+    deployment = {
+        "afd.connector": "MegaMoESplitAFDConnector",
+        "afd.compute_gate_on_attention": True,
+        "parallel_config.enable_dbo": False,
+        "parallel_config.use_ubatching": False,
+    }
+    _run_mrv2_validator(mrv2_config, "npu", role, deployment)
+    with pytest.raises(RuntimeError, match="MegaMoE requires eager"):
+        _run_mrv2_validator(
+            mrv2_config,
+            "npu",
+            role,
+            {**deployment, "model_config.enforce_eager": False},
+        )
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_routed_transport_preserves_runner_and_gate_policy(mrv2_config, role):
     mrv2_config.additional_config["afd"].update(
         role=role, connector="DeepEPM2NAFDConnector", compute_gate_on_attention=True
