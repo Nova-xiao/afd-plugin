@@ -55,13 +55,10 @@ requests: communication-window destruction requires the union-group barrier.
 **Plugin development is not an A5 runtime validation result.** Remote deployment,
 accuracy, long-run communication and performance checks have not been performed.
 
-- Ordinary CAM needs an **A5 build of its asynchronous communication operators**
-  implementing the existing dispatch-send/recv and combine-send/recv ABI with
-  BF16 transport. The local `cam_async` source inspected during development
-  registers those operators only for `ascend910_93`; that A3 bundle does not
-  establish an A5 implementation. Installing vLLM-Ascend and CANN alone does not
-  supply this dependency. This remains an external requirement for running the
-  ordinary CAM path; its kernels were not ported as part of this Plugin change.
+- Ordinary CAM's four bundled operators now include an A5 HCCL-window path,
+  AIV communication-engine selection, A5 registration and Python bindings.
+  Rebuild both OPP and extension, then follow [A5 verification](A5_ASYNC_CAM_VALIDATION.md).
+  This source adaptation has not yet been compiled or executed on A5.
 - MegaMoE needs the Ascend950 OPP and `umdk_cam_megamoe` wheel from UMDK
   [`793d2f02`](https://gitcode.com/lqy16/umdk/commit/793d2f02c2564eda1e0f8971040f8626d89295d0),
   including the ring-sequence changes. This is separate from the ordinary CAM
