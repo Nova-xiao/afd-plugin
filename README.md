@@ -19,8 +19,10 @@ tests for GPU and Ascend NPU deployments.
 > different hardware backends.
 
 The GPU and Ascend target is **vLLM `v0.32.0`** at commit `5df63a72`.
-The Ascend integration also targets vLLM-Ascend `bd42eea0`. The plugin does not modify the vLLM
-source tree. AFD behavior is installed through the `vllm.general_plugins` entry
+This A5 development branch targets vLLM-Ascend `f9c8e0bd` and CANN 9.2.1,
+as specified in [#537](https://github.com/vllm-project/afd-plugin/issues/537).
+See the [A5 development notes](docs/npu/A5_DSV4_ASYNC.md) for connector dependencies.
+The plugin does not modify the vLLM source tree. AFD behavior is installed through the `vllm.general_plugins` entry
 point, `--additional-config`, automatically selected role workers, plugin-owned
 model wrappers, and narrow version-scoped compatibility shims.
 

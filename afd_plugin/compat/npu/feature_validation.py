@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGAMOE_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -49,6 +50,12 @@ def fail_if_unsupported_npu_afd_features(
         vllm_config,
     )
 
+    if afd_config.connector == MEGAMOE_CONNECTOR:
+        from afd_plugin.connectors.npu.async_megamoe import validate_megamoe_config
+
+        validate_megamoe_config(vllm_config, afd_config)
+        return
+
     if is_dsv4:
         _fail_if_unsupported_dsv4_connector(afd_config)
 
@@ -59,7 +66,9 @@ def fail_if_unsupported_npu_afd_features(
             extra_info,
         )
         if is_dsv4:
-            _fail_if_unsupported_dsv4_async_features(afd_config, extra_info)
+            _fail_if_unsupported_dsv4_async_features(
+                afd_config, extra_info, vllm_config
+            )
         return
 
     if afd_config.compute_gate_on_attention:
@@ -124,6 +133,7 @@ def _is_dsv4_target(vllm_config: VllmConfig) -> bool:
 def _fail_if_unsupported_dsv4_async_features(
     afd_config: AFDConfig,
     extra_info: ConnectorExtraInfo,
+    vllm_config: VllmConfig,
 ) -> None:
     """Keep the initial DSV4 Async CAM target path deliberately narrow."""
     from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
@@ -137,6 +147,22 @@ def _fail_if_unsupported_dsv4_async_features(
             "DSV4 CAMAsyncAFDConnector requires AFDAsyncExtraInfo, got "
             f"{type(extra_info).__name__}",
         )
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        if (
+            extra_info.dynamic_quant != 0
+            or vllm_config.model_config.hf_config.expert_dtype != "fp4"
+            or not vllm_config.model_config.enforce_eager
+            or vllm_config.parallel_config.enable_eplb
+            or async_cam_layered_gmm_enabled()
+            or vllm_config.additional_config.get("enable_fused_mc2", 0)
+        ):
+            raise RuntimeError(
+                "A5 DSV4 Async CAM requires native FP4 experts, dynamicQuant=0, "
+                "eager execution, static EP, enable_fused_mc2=0 and layered GMM off"
+            )
+        return
     if extra_info.dynamic_quant != 1:
         raise RuntimeError(
             "DSV4 Flash-INT8 CAMAsyncAFDConnector requires dynamicQuant=1",

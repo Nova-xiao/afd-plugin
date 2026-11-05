@@ -24,7 +24,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -321,7 +321,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
     forward method; it invokes ``compute_ffn_output`` instead.
     """
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4DecoderLayer.__init__.
     # Patch reason: allocate Attention and FFN weights only on their AFD role.
     # Patch functionality: keep target HC/SP attributes and native layer forward,
@@ -372,9 +372,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
         self.use_sequence_parallel_moe = parallel_config.use_sequence_parallel_moe
-        self.enable_dsa_cp = (
-            native.enable_dsa_cp()
-        )  # TODO: delete this when native.enable_dsa_cp is sunset.
 
         # ### PATCH START: role-local Attention and remote experts
         self.mlp: (
@@ -392,7 +389,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
-                need_gather_q_kv=self.use_sequence_parallel_moe and self.enable_dsa_cp,
             )
             if self.compute_gate_on_attention:
                 self.mlp = AFDDeepseekV4AttentionGateRemoteMoE(
@@ -407,7 +403,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
             moe_config = config
-            if afd_config.connector == AFD_ASYNC_CONNECTOR:
+            if afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR):
                 moe_config = copy(config)
                 # HF validates this public field as int, but pinned native
                 # MoE uses only None to omit shared construction (0 builds a
@@ -490,7 +486,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
 
     fall_back_to_pt_during_load = False
 
-    # Upstream source: vllm-ascend bd42eea01d8312c4df469fabaed45f77a12df4d3,
+    # Upstream source: vllm-ascend f9c8e0bdb263d7a8c0270536f1ea00fa7373a84e,
     # vllm_ascend/models/deepseek_v4/model.py::DeepseekV4Model.__init__.
     # Patch reason: construct role-local decoder layers and retain AFD metadata.
     # Patch functionality: initialize the target SP/PP/HC/MTP model contract
@@ -500,7 +496,7 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         # ### PATCH START: initialize role-local model
         afd_config = parse_afd_config(vllm_config, validate=False)
         if (
-            afd_config.connector == AFD_ASYNC_CONNECTOR
+            afd_config.connector in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
             and not afd_config.compute_gate_on_attention
         ):
             raise ValueError(
@@ -761,7 +757,8 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             weights,
             role=self.afd_role,
             attn_owns_gate=bool(self.afd_config.compute_gate_on_attention),
-            attention_shared_experts=self.afd_config.connector == AFD_ASYNC_CONNECTOR,
+            attention_shared_experts=self.afd_config.connector
+            in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR),
         )
         loaded = super().load_weights(role_weights)
         return loaded

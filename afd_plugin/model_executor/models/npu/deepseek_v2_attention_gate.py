@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, cast
 
 import torch
+import torch_npu
 
 from afd_plugin.connectors import AFDF2ATransferPayload
 from afd_plugin.envs import force_balanced_topk_ids_enabled
@@ -196,7 +197,10 @@ def compute_attention_gate_moe_ffn(
 
     from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
     from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-    from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
+    from vllm_ascend.ops.fused_moe.dataclass.moe_quant import (
+        MoEMxfpParams,
+        MoEQuantParams,
+    )
     from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
     from vllm_ascend.quantization.quant_type import QuantType
 
@@ -262,9 +266,25 @@ def compute_attention_gate_moe_ffn(
                 w1_scale_bias=[bias1.detach()] if bias1 is not None else None,
                 w2_scale_bias=[bias2.detach()] if bias2 is not None else None,
             )
+    elif quant_type == QuantType.W4A8MXFP:
+        # CAM has already routed and grouped BF16 tokens. Preserve the native
+        # MXFP4 NZ weights and group-32 E8M0 scales; let the MX MLP quantize
+        # activations locally, without entering a second EP dispatch.
+        if hidden_states.dtype != torch.bfloat16 or dynamic_scales is not None:
+            raise ValueError(
+                "CAM MXFP4 experts require BF16 transport (dynamicQuant=0)"
+            )
+        if routed_experts.dynamic_eplb:
+            raise ValueError("CAM MXFP4 experts require static expert placement")
+        moe_weights = MoEWeights(
+            w1=routed_experts.w13_weight,
+            w2=routed_experts.w2_weight,
+            w1_scale=routed_experts.w13_weight_scale,
+            w2_scale=routed_experts.w2_weight_scale,
+        )
     else:
         raise RuntimeError(
-            "compute_gate_on_attention supports unquantized, W8A8 or W4A8 "
+            "compute_gate_on_attention supports unquantized, W8A8, W4A8 or W4A8MXFP "
             f"Ascend MoE experts, got {quant_type}",
         )
     use_gmmswigluquant_fusion = (
@@ -322,6 +342,17 @@ def compute_attention_gate_moe_ffn(
                 layer=routed_experts,
                 quant=MoEQuantParams(
                     quant_type=quant_type,
+                    mxfp=(
+                        MoEMxfpParams(
+                            act_quant_type=torch.float8_e4m3fn,
+                            weight_quant_type=torch_npu.float4_e2m1fn_x2,
+                            scale_dtype=torch_npu.float8_e8m0fnu,
+                            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+                            use_bf16=True,
+                        )
+                        if quant_type == QuantType.W4A8MXFP
+                        else None
+                    ),
                     is_per_channel_weight=(
                         routed_experts.quant_method.quant_method.is_per_channel_weight
                         if quant_type == QuantType.W4A8

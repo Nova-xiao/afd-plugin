@@ -28,6 +28,7 @@ from afd_plugin.compat.npu import (
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDConnectorFactory
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.connectors.npu.async_megamoe import CAMAsyncMegamoeAFDConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
@@ -207,7 +208,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 ):
                     torch.npu.synchronize()
                 continue
-            control_plane = self.model_runner.connector.control_plane
+            connector = self.model_runner.connector
+            if isinstance(connector, CAMAsyncMegamoeAFDConnector):
+                connector.execute_next_experts()
+                continue
+            control_plane = connector.control_plane
             assert control_plane is not None
             payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
@@ -240,16 +245,16 @@ class AFDNPUFFNWorker(NPUWorker):
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
-        if self._requires_async_drain():
+        if self._requires_async_drain() or isinstance(
+            self.model_runner.connector, CAMAsyncMegamoeAFDConnector
+        ):
             if event is not None:
                 event.set()
             thread = self._ffn_thread
             if thread is not None:
                 thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
                 if thread.is_alive():
-                    raise RuntimeError(
-                        "Async graph receive is pending; retain resources"
-                    )
+                    raise RuntimeError("FFN receive is pending; retain resources")
             self.raise_ffn_loop_error_if_any()
             self.model_runner.shutdown()
             self._ffn_thread = None

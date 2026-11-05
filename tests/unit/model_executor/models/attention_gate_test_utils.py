@@ -42,7 +42,9 @@ def load_attention_gate_moe_ffn(monkeypatch, apply_mlp):
     )
     exec(compile(ast.fix_missing_locations(code), str(source_path), "exec"), namespace)
 
-    quant_type = SimpleNamespace(NONE="none", W8A8="w8a8", W4A8="w4a8")
+    quant_type = SimpleNamespace(
+        NONE="none", W8A8="w8a8", W4A8="w4a8", W4A8MXFP="w4a8mxfp"
+    )
     modules = {
         "vllm_ascend.ops.fused_moe.moe_mlp": SimpleNamespace(apply_moe_mlp=apply_mlp),
         "vllm_ascend.ops.fused_moe.dataclass.moe_mlp": SimpleNamespace(
@@ -52,7 +54,7 @@ def load_attention_gate_moe_ffn(monkeypatch, apply_mlp):
             MoEWeights=SimpleNamespace
         ),
         "vllm_ascend.ops.fused_moe.dataclass.moe_quant": SimpleNamespace(
-            MoEQuantParams=SimpleNamespace
+            MoEQuantParams=SimpleNamespace, MoEMxfpParams=SimpleNamespace
         ),
         "vllm_ascend.quantization.quant_type": SimpleNamespace(QuantType=quant_type),
     }

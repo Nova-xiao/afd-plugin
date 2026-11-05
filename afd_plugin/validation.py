@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
+    MEGAMOE_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -168,6 +169,15 @@ def validate_npu_model_runner_v2_config(
                     "on Attention"
                 )
             requested_ffn_mode(vllm_config)
+    elif afd_config.connector == MEGAMOE_CONNECTOR:
+        if (
+            not afd_config.async_dp
+            or not vllm_config.model_config.enforce_eager
+            or not afd_config.compute_gate_on_attention
+        ):
+            raise RuntimeError(
+                "MegaMoE requires eager execution, async DP and Attention routing"
+            )
     elif (
         afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
     ):
