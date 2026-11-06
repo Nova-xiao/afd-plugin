@@ -38,6 +38,7 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SCENARIOS,
     DSV4_SYNC_CAMP2P_SCENARIOS,
     DSV4_SYNC_SHAPES,
+    DSV41_MEGAMOE_SCENARIO,
     sync_shape,
 )
 from tests.e2e.models.deepseek_v4_flash.gpu_config import (
@@ -506,6 +507,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_FFN_RANKS,
         ),
         DSV4_MEGAMOE_SCENARIO: (False, False, False, 2, 2),
+        DSV41_MEGAMOE_SCENARIO: (False, False, False, 2, 2),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -597,6 +599,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
+    elif args.scenario == DSV41_MEGAMOE_SCENARIO:
+        dsv4_config.configure_v41_megamoe_scenario(args)
     elif args.scenario == DSV4_MEGAMOE_SCENARIO:
         dsv4_config.configure_megamoe_scenario(args)
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
@@ -785,6 +789,9 @@ def build_vllm_command(
                 role, async_cam=args.scenario == DSV4_ASYNC_CAM_SCENARIO
             )
         )
+    if args.scenario == DSV41_MEGAMOE_SCENARIO:
+        afd_config.pop("enable_dsa_cp", None)  # removed in the #537 Ascend pin
+        afd_config["enable_fused_mc2"] = 0
     cmd = [
         args.vllm_bin,
         "serve",
@@ -927,6 +934,7 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
         ASYNC_UBATCH_SCENARIO,
         DSV4_ASYNC_CAM_SCENARIO,
         DSV4_MEGAMOE_SCENARIO,
+        DSV41_MEGAMOE_SCENARIO,
     )
 
 

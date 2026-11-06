@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""A5 single-stage eager MegaMoE backend for DeepSeek-V4-Flash."""
+"""A5 single-stage eager MegaMoE backend for DeepSeek V4 / V4.1."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 ROLE_SIZE = 2
 FLASH_GEOMETRY = (4096, 2048, 256, 6)
+MAX_LAYER_TENSORS = 1 << 16
 STARTUP_TIMEOUT = timedelta(minutes=30)
 
 
@@ -35,20 +36,49 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
     hf = config.model_config.hf_config
     if (
         get_ascend_device_type() != AscendDeviceType.A5
-        or hf.model_type != "deepseek_v4"
+        or hf.model_type not in ("deepseek_v4", "deepseek_v41")
         or (
-            hf.hidden_size,
-            hf.moe_intermediate_size,
-            hf.n_routed_experts,
-            hf.num_experts_per_tok,
+            hf.model_type == "deepseek_v4"
+            and (
+                hf.hidden_size,
+                hf.moe_intermediate_size,
+                hf.n_routed_experts,
+                hf.num_experts_per_tok,
+            )
+            != FLASH_GEOMETRY
         )
-        != FLASH_GEOMETRY
         or hf.expert_dtype != "fp4"
         or config.model_config.dtype != torch.bfloat16
     ):
         raise ValueError(
-            "MegaMoE requires A5 and native FP4 DeepSeek-V4-Flash with BF16 input"
+            "MegaMoE requires A5 and native FP4 DeepSeek V4 / V4.1 with BF16 input"
         )
+    # Match UMDK 74fa9f9a's supported geometry instead of assuming V4.1
+    # has V4 Flash's dimensions. The native config flattens text_config.
+    if not (
+        1024 <= hf.hidden_size <= 8192
+        and hf.hidden_size % 64 == 0
+        and 256 <= hf.moe_intermediate_size <= 4096
+        and hf.moe_intermediate_size % 128 == 0
+        and ROLE_SIZE <= hf.n_routed_experts <= 2048
+        and hf.n_routed_experts % ROLE_SIZE == 0
+        and 1 <= hf.num_experts_per_tok <= min(32, hf.n_routed_experts)
+        and 1 <= hf.num_hidden_layers <= MAX_LAYER_TENSORS
+        and hf.hidden_act == "silu"
+    ):
+        raise ValueError(
+            "Model geometry/activation is outside the MegaMoE split contract"
+        )
+    if hf.model_type == "deepseek_v41" and (
+        config.model_config.multimodal_config.get_limit_per_prompt("image") != 0
+    ):
+        raise ValueError("DSV4.1 MegaMoE requires text-only serving: limit image to 0")
+    if (
+        hf.model_type == "deepseek_v41"
+        and config.engram_config is not None
+        and config.engram_config.embedding_across_dp
+    ):
+        raise ValueError("Async Attention DPs require embedding_across_dp=false")
     if config.additional_config.get("enable_fused_mc2", 0):
         raise ValueError(
             "MegaMoE split requires enable_fused_mc2=0 for packed layer weights"
@@ -111,7 +141,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         self.group = None
         self.buffer = None
         self.ticket = None
-        self.weights = {}
+        self.weights = ([], [], [], [])
 
     @property
     def is_initialized(self) -> bool:
@@ -121,12 +151,21 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         from afd_plugin.model_executor.npu.megamoe_weights import expert_weights
 
         hf = self.vllm_config.model_config.hf_config
-        self.weights = {
-            layer.layer_idx: expert_weights(
+        ordered = sorted(layers, key=lambda layer: layer.layer_idx)
+        if [layer.layer_idx for layer in ordered] != list(range(len(ordered))):
+            raise ValueError(
+                "MegaMoE layer bank requires consecutive layer IDs from zero"
+            )
+        if not ordered:
+            raise ValueError("MegaMoE requires a nonempty layer bank")
+        bank = ([], [], [], [])
+        for layer in ordered:
+            weights = expert_weights(
                 layer.mlp, self.role_rank, hf.hidden_size, hf.moe_intermediate_size
             )
-            for layer in layers
-        }
+            for tensors, layer_tensors in zip(bank, weights, strict=True):
+                tensors.extend(layer_tensors)
+        self.weights = bank
 
     def init_afd_connector(self) -> None:
         if self.is_initialized:
@@ -172,7 +211,13 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                     hf.num_experts_per_tok,
                     shared_experts=0,
                     combine_quant_mode=0,
-                    activation_parameters=(hf.swiglu_limit, 1.702, 1.0),
+                    activation_parameters=(
+                        hf.swiglu_limit
+                        if hf.swiglu_limit is not None
+                        else torch.finfo(torch.float32).max,
+                        1.702,
+                        1.0,
+                    ),
                 )
         except Exception:
             dist.destroy_process_group(self.group)
@@ -197,6 +242,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             self.buffer,
             [self.role_rank],
             sequence,
+            layer_index=context.metadata.layer_idx,
         )
 
         self.work.publish(self.role_rank, context.metadata.layer_idx, sequence)
@@ -218,7 +264,9 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             time.sleep(POLL_SECONDS)
             return
         dp, layer, sequence = item
-        self.ops.megamoe_fused_moe(*self.weights[layer], self.buffer, [dp], sequence)
+        if not 0 <= layer < len(self.weights[0]):
+            raise ValueError(f"Unknown MegaMoE layer {layer}")
+        self.ops.megamoe_fused_moe(*self.weights, self.buffer, [dp], sequence)
         # Bound device submissions and retain layer tensors until fused work
         # completes. Other Attention DPs remain independently scheduled.
         torch.npu.synchronize()
@@ -241,4 +289,4 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             dist.destroy_process_group(self.group)
             self.group = None
         self.ticket = None
-        self.weights.clear()
+        self.weights = ([], [], [], [])

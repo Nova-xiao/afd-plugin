@@ -182,6 +182,7 @@ def construct_model():
             "_ATTENTION_ROLE": "attention",
             "_FFN_ROLE": "ffn",
             "AFD_ASYNC_CONNECTOR": "CAMAsyncAFDConnector",
+            "MEGAMOE_CONNECTOR": "CAMAsyncMegamoeAFDConnector",
             "parse_afd_config": lambda config, **kwargs: config.afd,
             "_refresh_ascend_fused_moe": lambda: None,
             "AFDDeepseekV4RemoteMoE": lambda **kwargs: nn.Identity(),

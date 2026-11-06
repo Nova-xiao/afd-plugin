@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
+DSV41_MEGAMOE_SCENARIO = "afd-dsv41-flash-megamoe-eager-2a2f"
 DSV4_MEGAMOE_SCENARIO = "afd-dsv4-flash-megamoe-eager-2a2f"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
 DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
@@ -24,6 +25,7 @@ DSV4_SYNC_CAMP2P_SCENARIOS = (
 DSV4_SCENARIOS = (
     DSV4_ASYNC_CAM_SCENARIO,
     DSV4_MEGAMOE_SCENARIO,
+    DSV41_MEGAMOE_SCENARIO,
     *DSV4_SYNC_CAMP2P_SCENARIOS,
 )
 DSV4_ATTENTION_RANKS = 8
@@ -387,6 +389,22 @@ def configure_megamoe_scenario(args: argparse.Namespace) -> None:
         max_num_batched_tokens=DSV4_SYNC_MAX_NUM_BATCHED_TOKENS,
         memory_utilization=None,
         multithread_load=False,
+    )
+
+
+def configure_v41_megamoe_scenario(args: argparse.Namespace) -> None:
+    """#537 text-only V4.1, native Engram offload and eager 2A2F."""
+    configure_megamoe_scenario(args)
+    mode = args.common_vllm_arg.index("--tokenizer-mode") + 1
+    args.common_vllm_arg[mode] = "deepseek_v41"
+    args.common_vllm_arg.extend(
+        ["--limit-mm-per-prompt", '{"image":0}', "--dtype", "bfloat16"]
+    )
+    args.attention_vllm_arg.extend(
+        [
+            "--engram-config",
+            '{"cpu_offload":true,"embedding_across_dp":false}',
+        ]
     )
 
 

@@ -9,3 +9,5 @@ The old 0.30 launch instructions do not apply to this branch.
 
 The retained `afd-dsv4-flash-megamoe-eager-2a2f` E2E scenario generates a 2A2F eager
 configuration for later device verification; it has not been run on A5.
+
+For the updated UMDK interface and DSV4.1, see [A5 DSV4.1 MegaMoE](A5_DSV41_MEGAMOE.md).

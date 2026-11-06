@@ -12,7 +12,8 @@ This branch starts at AFD `update/v0.32.0`, commit `2917805`, and targets the
 | CANN | 9.2.1 |
 | Model | DeepSeek-V4-Flash, original FP8 checkpoint with MXFP4 routed experts |
 
-The model target is V4 Flash, not V4.1. The existing A3 validation record uses an
+The four-operator async CAM target remains V4 Flash. MegaMoE also has a
+[V4.1 adapter and launch scenario](A5_DSV41_MEGAMOE.md). The existing A3 validation record uses an
 older Ascend commit and does not establish A5 support. This branch removes the
 DSV4 wrapper's calls to the DSA-CP interfaces deleted in the target Ascend source.
 The native loader, attention, HC, hash routing and shared-expert arithmetic remain
@@ -26,7 +27,7 @@ responsible for the model semantics.
 | Transfer input | BF16 (`dynamicQuant=0`) | Dispatch quantizes BF16 to MXFP8 inside the operator |
 | FFN | CAM receive, native MXFP4 expert MLP, CAM send | One fused receive + expert MLP + send operator |
 | Weights | Native transposed FP4 NZ tensors and E8M0 scales | Output-major FP4 C0=32 storage and E8M0 scales, prepared once after loading |
-| Scheduling | Existing CAM device work selection | Bounded per-DP/per-FFN Store descriptors select layer and generation; tensors travel through MTE |
+| Scheduling | Existing CAM device work selection | Store descriptors schedule DP/generation; dispatch publishes layer ID to MTE and FFN selects from the full weight bank |
 
 Both use `afd.async=true` and `afd.compute_gate_on_attention=true`. Attention
 DPs can progress independently. Both require eager ModelRunnerV2 for this A5
@@ -34,7 +35,7 @@ path. Use `enable_fused_mc2=0` so native loading retains the tensors consumed by
 these backends. The A3 layered INT4/INT8 executor is not the A5 MXFP4 executor;
 leave `AFD_ASYNC_CAM_LAYERED_GMM` disabled.
 
-For ordinary CAM, the BF16 receive scale output is a placeholder. The connector
+For the four-operator asynchronous CAM path, the BF16 receive scale output is a placeholder. The connector
 now passes `None` to the FFN MLP, causing the native MX method to perform group-32
 MXFP8 activation quantization. Passing the placeholder would incorrectly suppress
 that quantization. The FFN MLP consumes the native weights directly and does not
@@ -55,13 +56,13 @@ requests: communication-window destruction requires the union-group barrier.
 **Plugin development is not an A5 runtime validation result.** Remote deployment,
 accuracy, long-run communication and performance checks have not been performed.
 
-- Ordinary CAM's four bundled operators now include an A5 HCCL-window path,
+- The asynchronous CAM path's four bundled operators now include an A5 HCCL-window path,
   AIV communication-engine selection, A5 registration and Python bindings.
   Rebuild both OPP and extension, then follow [A5 verification](A5_ASYNC_CAM_VALIDATION.md).
   This source adaptation has not yet been compiled or executed on A5.
 - MegaMoE needs the Ascend950 OPP and `umdk_cam_megamoe` wheel from UMDK
-  [`793d2f02`](https://gitcode.com/lqy16/umdk/commit/793d2f02c2564eda1e0f8971040f8626d89295d0),
-  including the ring-sequence changes. This is separate from the ordinary CAM
+  [`74fa9f9a`](https://gitcode.com/lqy16/umdk/commit/74fa9f9ad59ca57830028a459e70661c4574a18e),
+  including ring sequences and device-side layer selection. This is separate from the four-operator asynchronous CAM
   bundle. Its three Python entry points are `megamoe_dispatch_send`,
   `megamoe_fused_moe`, and `megamoe_combine_recv`.
 - MegaMoE's one-time FP4 storage conversion preserves packed nibbles; its
@@ -71,7 +72,7 @@ accuracy, long-run communication and performance checks have not been performed.
 ## Configuration contract
 
 Supply role, rendezvous and rank counts as usual. The relevant additional-config
-fields for ordinary CAM are:
+fields for four-operator asynchronous CAM are:
 
 ```json
 {

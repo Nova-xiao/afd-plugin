@@ -111,6 +111,9 @@ _DEEPSEEK_MODEL_REGISTRATIONS = {
         if importlib.util.find_spec("torch_npu") is not None
         else "afd_plugin.model_executor.models.deepseek_v4:AFDDeepseekV4ForCausalLM"
     ),
+    "DeepseekV41ForCausalLM": (
+        "afd_plugin.model_executor.models.npu.deepseek_v41:AFDDeepseekV41ForCausalLM"
+    ),
     "GlmMoeDsaForCausalLM": (
         "afd_plugin.model_executor.models.deepseek_v2:AFDGlmMoeDsaForCausalLM"
     ),
