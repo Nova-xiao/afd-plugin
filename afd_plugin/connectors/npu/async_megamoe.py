@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from afd_plugin.config import AFDConfig
     from afd_plugin.connectors.metadata import AFDTransferContext
 
-ROLE_SIZE = 2
 FLASH_GEOMETRY = (4096, 2048, 256, 6)
 STARTUP_TIMEOUT = timedelta(minutes=30)
 
@@ -53,10 +52,25 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
         raise ValueError(
             "MegaMoE split requires enable_fused_mc2=0 for packed layer weights"
         )
+    attn, ffn = afd.num_attention_ranks, afd.num_ffn_ranks
+    world = attn + ffn
+    experts = hf.n_routed_experts
+    # UMDK SplitLayout / arch35 tiling bound the union group and count table.
+    if not (
+        attn > 0
+        and ffn > 0
+        and world <= 768
+        and ffn <= experts <= 2048
+        and experts % ffn == 0
+        and experts // ffn <= 1024
+        and world * (experts // ffn) <= 16384
+    ):
+        raise ValueError(
+            f"Invalid MegaMoE split geometry: A={attn}, F={ffn}, E={experts}"
+        )
     p = config.parallel_config
     if (
-        (afd.num_attention_ranks, afd.num_ffn_ranks) != (ROLE_SIZE, ROLE_SIZE)
-        or p.data_parallel_size != ROLE_SIZE
+        p.data_parallel_size != (attn if afd.role == "attention" else ffn)
         or (
             p.tensor_parallel_size,
             p.pipeline_parallel_size,
@@ -71,7 +85,10 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
         or p.eplb_config.num_redundant_experts
         or p.use_sequence_parallel_moe
     ):
-        raise ValueError("MegaMoE requires 2A2F, DP2/TP1 and static contiguous FFN EP2")
+        raise ValueError(
+            "MegaMoE requires role DP size equal to its rank count, TP/PP/CP=1, "
+            "and static contiguous FFN EP"
+        )
     if (
         not config.model_config.enforce_eager
         or not config.use_v2_model_runner
