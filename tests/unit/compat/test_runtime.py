@@ -195,6 +195,17 @@ def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
     assert config.parallel_config.ubatch_size == 4
     assert config.parallel_config.all2all_backend == "deepep_low_latency"
 
+    for connector in ("CAMAsyncAFDConnector", "CAMAsyncMegamoeAFDConnector"):
+        config = afd_vllm_config()
+        config.additional_config["afd"].update(connector=connector, async_dp=True)
+        parallel = config.parallel_config
+        parallel.enable_dbo = False
+        parallel.ubatch_size = parallel.num_ubatches = 2
+        parallel.dbo_decode_token_threshold = parallel.dbo_prefill_token_threshold = 2
+        for _ in range(2):
+            NPUPlatform.check_and_update_config(config)
+            assert parallel.enable_dbo and parallel.ubatch_size == 2
+
     failing_config = afd_vllm_config()
     failing_config.fail_update = True
     with pytest.raises(RuntimeError, match="upstream config failure"):
