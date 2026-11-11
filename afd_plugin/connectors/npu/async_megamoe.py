@@ -41,6 +41,17 @@ class MegaMoEExtraInfo(ConnectorExtraInfo):
         return {"attn_ranks_per_dp": self.attn_ranks_per_dp}
 
 
+@dataclass
+class MegaMoEStage:
+    group: Any
+    buffer: Any
+    work: ExpertWorkQueue
+    sequence: int = 0
+    ticket: Any = None
+    stream: Any = None
+    completion: Any = None
+
+
 def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
     hf = config.model_config.hf_config
     if (
@@ -149,15 +160,13 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         self.world_rank = (
             role_rank if afd_config.role == "attention" else self.attn_size + role_rank
         )
-        self.group = None
-        self.buffer = None
-        self.ticket = None
-        self.sequence = 0
+        self.stages: list[MegaMoEStage] = []
+        self.next_stage = 0
         self.weights = {}
 
     @property
     def is_initialized(self) -> bool:
-        return self.buffer is not None
+        return bool(self.stages)
 
     def prepare_layers(self, layers) -> None:
         from afd_plugin.model_executor.npu.megamoe_weights import expert_weights
@@ -177,7 +186,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
 
         self.ops = ops
         stores = []
-        self.group = init_afd_process_group(
+        group = init_afd_process_group(
             backend="hccl",
             init_method=f"tcp://{self.afd_config.host}:{self.afd_config.port}",
             world_size=self.attn_size + self.ffn_size,
@@ -196,9 +205,11 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                 if attention
                 else 0
             )
+            parallel = self.vllm_config.parallel_config
+            dbo = attention and (parallel.enable_dbo or parallel.use_ubatching)
             store.set(
                 f"tp/{self.world_rank}",
-                f"{width} {self.extra_info.attn_ranks_per_dp or 0}",
+                f"{width} {self.extra_info.attn_ranks_per_dp or 0} {int(dbo)}",
             )
             widths = [
                 tuple(map(int, store.get(f"tp/{i}").split()))
@@ -207,14 +218,15 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             self.attn_tp = widths[0][0]
             if (
                 self.attn_size % self.attn_tp
-                or any(actual != self.attn_tp for actual, _ in widths[: self.attn_size])
-                or any(declared not in (0, self.attn_tp) for _, declared in widths)
+                or any(
+                    actual != self.attn_tp for actual, _, _ in widths[: self.attn_size]
+                )
+                or any(declared not in (0, self.attn_tp) for _, declared, _ in widths)
             ):
                 raise ValueError("Inconsistent Attention TP / attn_ranks_per_dp")
-            self.work = ExpertWorkQueue(
-                store, self.attn_size // self.attn_tp, self.ffn_size, ops.split_sequence
-            )
-            self.sequence = 0
+            dual_stage = widths[0][2]
+            if any(dbo != dual_stage for _, _, dbo in widths[: self.attn_size]):
+                raise ValueError("All Attention ranks must agree on MegaMoE ubatching")
             # Only Attention schedulers own the token limit. All window offsets
             # must be derived from the same capacity, including on FFN workers.
             if self.afd_config.role == "attention":
@@ -229,23 +241,53 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                 int(store.get(f"capacity/{dp}")) for dp in range(self.attn_size)
             )
             hf = self.vllm_config.model_config.hf_config
-            with DefaultProcessGroupSwitcher(dist.group.WORLD, self.group):
-                self.buffer = ops.create_megamoe_split_buffer(
-                    self.group,
-                    self.attn_size,
-                    self.ffn_size,
-                    hf.n_routed_experts,
-                    capacity,
-                    hf.hidden_size,
-                    hf.moe_intermediate_size,
-                    hf.num_experts_per_tok,
-                    shared_experts=0,
-                    combine_quant_mode=0,
-                    activation_parameters=(hf.swiglu_limit, 1.702, 1.0),
+            for stage in range(1 + dual_stage):
+                if stage:
+                    # An independent HCCL domain isolates UMDK's payload AND its
+                    # per-FFN AIV progress words. Reuse the rendezvous TCPStore.
+                    group = init_afd_process_group(
+                        backend="hccl",
+                        existing_store=stores[0],
+                        world_size=self.attn_size + self.ffn_size,
+                        rank=self.world_rank,
+                        group_name="afd_megamoe_stage1",
+                        timeout=STARTUP_TIMEOUT,
+                    )
+                with DefaultProcessGroupSwitcher(dist.group.WORLD, group):
+                    buffer = ops.create_megamoe_split_buffer(
+                        group,
+                        self.attn_size,
+                        self.ffn_size,
+                        hf.n_routed_experts,
+                        capacity,
+                        hf.hidden_size,
+                        hf.moe_intermediate_size,
+                        hf.num_experts_per_tok,
+                        shared_experts=0,
+                        combine_quant_mode=0,
+                        activation_parameters=(hf.swiglu_limit, 1.702, 1.0),
+                    )
+                lane = MegaMoEStage(
+                    group,
+                    buffer,
+                    ExpertWorkQueue(
+                        dist.PrefixStore(f"stage/{stage}", store),
+                        self.attn_size // self.attn_tp,
+                        self.ffn_size,
+                        ops.split_sequence,
+                    ),
                 )
+                self.stages.append(lane)
+                if dual_stage and not attention:
+                    lane.stream = torch.npu.Stream()
+                    lane.stream.wait_stream(torch.npu.current_stream())
         except Exception:
-            dist.destroy_process_group(self.group)
-            self.group = None
+            if all(group is not lane.group for lane in self.stages):
+                dist.destroy_process_group(group)
+            for lane in reversed(self.stages):
+                lane.buffer.destroy()
+                dist.destroy_process_group(lane.group)
+            self.stages.clear()
             raise
 
     def send_attn_output(
@@ -255,27 +297,29 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         **kwargs: torch.Tensor,
     ) -> None:
         stage = context.metadata.stage_idx
-        if self.ticket is not None or stage not in (0, 1):
+        if not 0 <= stage < len(self.stages):
+            raise RuntimeError("Unexpected MegaMoE Attention ubatch")
+        lane = self.stages[stage]
+        if lane.ticket is not None:
             raise RuntimeError(
-                "MegaMoE eager supports one outstanding Attention ticket"
+                "MegaMoE eager supports one outstanding ticket per ubatch"
             )
         dp = self.role_rank // self.attn_tp
         members = self.dp_members(dp)
-        sequence = self.ops.split_sequence(self.sequence + 1)
+        sequence = self.ops.split_sequence(lane.sequence + 1)
         ticket = self.ops.megamoe_dispatch_send(
             hidden_states.contiguous(),
             kwargs["topk_ids"].int().contiguous(),
             kwargs["topk_weights"].float().contiguous(),
-            self.buffer,
+            lane.buffer,
             members,
             sequence,
         )
 
-        # The peer receive hook drains this ticket before the next send.
-        self.ticket = (stage, ticket)
-        self.sequence = sequence
+        lane.ticket = ticket
+        lane.sequence = sequence
         if self.role_rank == members[0]:
-            self.work.publish(dp, context.metadata.layer_idx, sequence)
+            lane.work.publish(dp, context.metadata.layer_idx, sequence)
 
     def dp_members(self, dp: int) -> list[int]:
         start = dp * self.attn_tp
@@ -284,24 +328,39 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
     def recv_ffn_output(
         self, ref_tensor: torch.Tensor, ubatch_idx: int = 0, **kwargs
     ) -> torch.Tensor:
-        if self.ticket is None or ubatch_idx != self.ticket[0]:
+        if (
+            not 0 <= ubatch_idx < len(self.stages)
+            or self.stages[ubatch_idx].ticket is None
+        ):
             raise RuntimeError("MegaMoE combine requires the matching ubatch ticket")
-        output = self.ops.megamoe_combine_recv(self.ticket[1], self.buffer)
-        self.ticket = None
+        lane = self.stages[ubatch_idx]
+        output = self.ops.megamoe_combine_recv(lane.ticket, lane.buffer)
+        lane.ticket = None
         return output
 
     def execute_next_experts(self) -> None:
-        item = self.work.poll(self.role_rank)
-        if item is None:
-            time.sleep(POLL_SECONDS)
+        for offset in range(len(self.stages)):
+            idx = (self.next_stage + offset) % len(self.stages)
+            lane = self.stages[idx]
+            if lane.completion is not None and not lane.completion.query():
+                continue
+            item = lane.work.poll(self.role_rank)
+            if item is None:
+                continue
+            dp, layer, sequence = item
+            args = (*self.weights[layer], lane.buffer, self.dp_members(dp), sequence)
+            if lane.stream is None:
+                self.ops.megamoe_fused_moe(*args)
+                torch.npu.synchronize()
+            else:
+                with torch.npu.stream(lane.stream):
+                    self.ops.megamoe_fused_moe(*args)
+                    if lane.completion is None:
+                        lane.completion = torch.npu.Event()
+                    lane.completion.record(lane.stream)
+            self.next_stage = (idx + 1) % len(self.stages)
             return
-        dp, layer, sequence = item
-        self.ops.megamoe_fused_moe(
-            *self.weights[layer], self.buffer, self.dp_members(dp), sequence
-        )
-        # Bound device submissions and retain layer tensors until fused work
-        # completes. Other Attention DPs remain independently scheduled.
-        torch.npu.synchronize()
+        time.sleep(POLL_SECONDS)
 
     def recv_attn_output(self, ubatch_idx=0, **kwargs):
         raise RuntimeError(
@@ -312,13 +371,12 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         raise RuntimeError("MegaMoE FFN sends results inside fused_moe")
 
     def close(self) -> None:
-        if self.buffer is not None:
+        if self.stages:
             torch.npu.synchronize()
-            dist.barrier(group=self.group)
-            self.buffer.destroy()
-            self.buffer = None
-        if self.group is not None:
-            dist.destroy_process_group(self.group)
-            self.group = None
-        self.ticket = None
+        for lane in reversed(self.stages):
+            dist.barrier(group=lane.group)
+            lane.buffer.destroy()
+            dist.destroy_process_group(lane.group)
+        self.stages.clear()
+        self.next_stage = 0
         self.weights.clear()

@@ -299,6 +299,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             afd_metadata.connector,
             dispatch_payload.hidden_states,
             context,
+            independent_windows=self.megamoe,
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )

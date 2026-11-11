@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,7 +113,8 @@ def test_role_sizes_and_tiling_limits(validate, a, f, role, dp, valid, tp):
             validate(config, afd)
 
 
-def test_tp_members_share_generation_and_publish_once():
+@pytest.fixture
+def connector_class():
     # Exercise the connector's wire calls without importing the NPU runtime.
     path = (
         Path(__file__).resolve().parents[4]
@@ -133,44 +135,98 @@ def test_tp_members_share_generation_and_publish_once():
         in {"send_attn_output", "recv_ffn_output", "dp_members", "execute_next_experts"}
     ]
     tree.body = [cls]
-    ns = {"torch": SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None))}
+    ns = {
+        "torch": SimpleNamespace(npu=SimpleNamespace()),
+        "time": SimpleNamespace(sleep=lambda _: None),
+        "POLL_SECONDS": 0,
+    }
     exec(compile(tree, str(path), "exec"), ns)
-    connector = ns[cls.name]
-    calls, notifications, fused = [], [], []
-    ops = SimpleNamespace(
-        split_sequence=lambda n: (n - 1) % 32 + 1,
-        megamoe_dispatch_send=lambda *args: calls.append(args[-2:]),
-        megamoe_fused_moe=lambda *args: fused.append(args[-2:]),
-    )
-    ranks = [connector() for _ in range(6)]
+    return ns[cls.name], ns["torch"].npu
+
+
+def test_tp_members_share_generation_and_publish_once(connector_class):
+    connector, _ = connector_class
+    notifications = [[], []]
     tensor = SimpleNamespace()
     tensor.contiguous = tensor.int = tensor.float = lambda: tensor
-    ctx = SimpleNamespace(metadata=SimpleNamespace(stage_idx=0, layer_idx=7))
-    for i, rank in enumerate(ranks):
-        rank.role_rank, rank.attn_tp, rank.sequence = i, 2, 32
-        rank.ticket = rank.buffer = None
-        rank.ops = ops
-        rank.work = SimpleNamespace(publish=lambda *args: notifications.append(args))
-        rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
-    assert notifications == [(0, 7, 1), (1, 7, 1), (2, 7, 1)]
-    assert calls == [
-        (members, 1) for members in ([0, 1], [2, 3], [4, 5]) for _ in range(2)
-    ]
-    # A handoff must consume the owner's ticket before the peer can publish.
-    ops.megamoe_combine_recv = lambda ticket, buffer: ticket
-    for rank in ranks:
+
+    def dispatch(hidden, ids, weights, buffer, members, sequence):
+        return buffer, members, sequence
+
+    def combine(ticket, buffer):
+        assert ticket[0] == buffer
+        return ticket
+
+    for i in range(6):
+        rank = connector()
+        rank.role_rank, rank.attn_tp = i, 2
+        rank.ops = SimpleNamespace(
+            split_sequence=lambda n: (n - 1) % 32 + 1,
+            megamoe_dispatch_send=dispatch,
+            megamoe_combine_recv=combine,
+        )
+        rank.stages = [
+            SimpleNamespace(
+                buffer=stage,
+                sequence=seq,
+                ticket=None,
+                work=SimpleNamespace(publish=lambda *args, log=log: log.append(args)),
+            )
+            for stage, (seq, log) in enumerate(
+                zip((32, 12), notifications, strict=True)
+            )
+        ]
+        for stage in (0, 1):
+            ctx = SimpleNamespace(
+                metadata=SimpleNamespace(stage_idx=stage, layer_idx=7)
+            )
+            rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
+            with pytest.raises(RuntimeError, match="outstanding"):
+                rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
+        members = rank.dp_members(i // 2)
+        assert rank.recv_ffn_output(tensor, 1) == (1, members, 13)
+        assert rank.recv_ffn_output(tensor, 0) == (0, members, 1)
         with pytest.raises(RuntimeError, match="matching ubatch"):
             rank.recv_ffn_output(tensor, 1)
-        rank.recv_ffn_output(tensor, 0)
-    ctx.metadata.stage_idx = 1
-    for rank in ranks:
-        rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
-        with pytest.raises(RuntimeError, match="outstanding"):
-            rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
-        rank.recv_ffn_output(tensor, 1)
-    assert notifications[3:] == [(0, 7, 2), (1, 7, 2), (2, 7, 2)]
-    for item in notifications:
-        rank.work = SimpleNamespace(poll=lambda _, task=item: task)
-        rank.weights = {7: ()}
+    assert notifications == [[(dp, 7, seq) for dp in range(3)] for seq in (1, 13)]
+
+
+def test_ffn_submits_free_stage_without_waiting_for_busy_peer(connector_class):
+    connector, npu = connector_class
+
+    class Event:
+        done = False
+
+        def record(self, stream):
+            self.done = False
+            self.stream = stream
+
+        def query(self):
+            return self.done
+
+    npu.stream = lambda stream: nullcontext()
+    npu.Event = Event
+    npu.synchronize = lambda: pytest.fail("unexpected device-wide wait")
+    rank = connector()
+    rank.role_rank, rank.attn_tp, rank.next_stage = 0, 2, 0
+    rank.weights = {7: ("layer7",), 8: ("layer8",)}
+    calls = []
+    rank.ops = SimpleNamespace(megamoe_fused_moe=lambda *args: calls.append(args))
+    rank.stages = []
+    for stage in range(2):
+        tasks = iter([(stage, 7 + stage, 1), (stage, 7 + stage, 2)])
+        rank.stages.append(
+            SimpleNamespace(
+                buffer=stage,
+                stream=stage,
+                completion=None,
+                work=SimpleNamespace(poll=lambda _, q=tasks: next(q)),
+            )
+        )
+    for _ in range(3):
         rank.execute_next_experts()
-    assert fused == calls[::2]
+    assert calls == [("layer7", 0, [0, 1], 1), ("layer8", 1, [2, 3], 1)]
+    assert [lane.completion.stream for lane in rank.stages] == [0, 1]
+    rank.stages[1].completion.done = True
+    rank.execute_next_experts()
+    assert calls[-1] == ("layer8", 1, [2, 3], 2)

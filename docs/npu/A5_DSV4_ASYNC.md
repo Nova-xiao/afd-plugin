@@ -40,12 +40,11 @@ MXFP8 activation quantization. Passing the placeholder would incorrectly suppres
 that quantization. The FFN MLP consumes the native weights directly and does not
 perform another EP dispatch. Top-k scaling remains applied once by combine.
 
-For MegaMoE, the connector owns the shared communication context and dispatch
-ticket. Each DP advances the UMDK ring sequence from 1 through 32 and back to 1.
+For MegaMoE, each ubatch stage owns a communication window and dispatch ticket.
+Within each window, each Attention DP advances the UMDK ring sequence from 1 through 32 and back to 1.
 Every FFN rank consumes the descriptor, including ranks with no selected expert.
 The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
-The FFN loop drains each fused submission before selecting another descriptor,
-which bounds queued work without synchronizing independent Attention DPs.
+Each FFN rank admits at most one fused submission per window at a time.
 The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
 MTE supernode; no graphs, MTP or EPLB. Close the roles together after draining
 requests: communication-window destruction requires the union-group barrier.
@@ -103,8 +102,16 @@ A5 qualification; the existing 2A2F test recipe uses TP1.
 For eager MegaMoE DBO, enable `--enable-dbo` on Attention only, with two
 ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
-to exercise splitting with eligible requests. The two stages share one window:
-the peer receive hook submits combine for the previous owner before dispatching
-the next shard. Each dispatch advances the same per-DP generation. FFN processes
-the two work items through its ordinary fused loop. Below threshold, Attention
-uses a single stage. A5 device qualification of this DBO path is pending.
+to exercise splitting with eligible requests. Attention dispatches each shard
+into its own registered window and combines it with its own ticket after the
+DBO yield. Each FFN rank polls both stage queues. While one fused kernel is in
+flight it can submit work for the other stage on a second NPU stream. An event
+on each stream protects its window until the previous fused kernel completes.
+Both stages use the same expert weights.
+
+DBO allocates two full-capacity windows per rank and two HCCL groups at startup.
+Batches below the split threshold use stage 0. With Attention DBO disabled,
+the connector allocates one window and uses the original serial FFN loop.
+To verify hardware overlap, profile eligible batches after warmup and compare
+the two FFN streams' fused kernel intervals. Concurrent host submission alone
+does not establish simultaneous AIC/AIV execution or a throughput gain.
