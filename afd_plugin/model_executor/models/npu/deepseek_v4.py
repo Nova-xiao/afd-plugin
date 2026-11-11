@@ -206,6 +206,9 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         vllm_config: VllmConfig,
     ) -> None:
         super().__init__(layer_idx=layer_idx)
+        self.megamoe = (
+            parse_afd_config(vllm_config, validate=False).connector == MEGAMOE_CONNECTOR
+        )
         self.use_sequence_parallel_moe = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
@@ -280,6 +283,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_ids,
             None,
             use_sequence_parallel=self.use_sequence_parallel_moe,
+            distinct_padding_ids=self.megamoe,
         )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:

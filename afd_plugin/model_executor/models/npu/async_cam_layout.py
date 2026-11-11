@@ -54,6 +54,7 @@ def prepare_cam_dispatch_payload(
     router_logits: torch.Tensor | None,
     *,
     use_sequence_parallel: bool,
+    distinct_padding_ids: bool = False,
 ) -> CAMDispatchPayload:
     """Convert the model token layout to one rank-local CAM payload.
 
@@ -117,10 +118,16 @@ def prepare_cam_dispatch_payload(
         tp_size=tp_size,
     )
     _log_cam_layout("dispatch", layout)
+    padded_ids = _pad_first_dim(topk_ids, padded_tokens)
+    if distinct_padding_ids and padded_tokens > parent_tokens:
+        # UMDK allocates at most one route per token in each expert slot.
+        padded_ids[parent_tokens:] = torch.arange(
+            topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
+        )
     return CAMDispatchPayload(
         hidden_states=_pad_first_dim(hidden_states, padded_tokens)[local_token_slice],
         topk_weights=_pad_first_dim(topk_weights, padded_tokens)[local_token_slice],
-        topk_ids=_pad_first_dim(topk_ids, padded_tokens)[local_token_slice],
+        topk_ids=padded_ids[local_token_slice],
         router_logits=(
             None
             if router_logits is None

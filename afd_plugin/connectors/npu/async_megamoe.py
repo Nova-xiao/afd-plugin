@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,16 @@ if TYPE_CHECKING:
 
 FLASH_GEOMETRY = (4096, 2048, 256, 6)
 STARTUP_TIMEOUT = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class MegaMoEExtraInfo(ConnectorExtraInfo):
+    attn_ranks_per_dp: int | None = None
+
+    def to_mapping(self):
+        if self.attn_ranks_per_dp is None:
+            return {}
+        return {"attn_ranks_per_dp": self.attn_ranks_per_dp}
 
 
 def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
@@ -70,24 +81,30 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
         )
     p = config.parallel_config
     if (
-        p.data_parallel_size != (attn if afd.role == "attention" else ffn)
+        p.data_parallel_size * p.tensor_parallel_size
+        != (attn if afd.role == "attention" else ffn)
         or (
-            p.tensor_parallel_size,
             p.pipeline_parallel_size,
             p.prefill_context_parallel_size,
             p.decode_context_parallel_size,
         )
-        != (1, 1, 1, 1)
-        or (afd.role == "ffn" and not p.enable_expert_parallel)
+        != (1, 1, 1)
+        or (
+            afd.role == "ffn"
+            and (not p.enable_expert_parallel or p.use_sequence_parallel_moe)
+        )
         or p.expert_placement_strategy != "linear"
         or p.enable_eplb
         or p.enable_elastic_ep
         or p.eplb_config.num_redundant_experts
-        or p.use_sequence_parallel_moe
+        or (
+            afd.role == "attention"
+            and config.scheduler_config.max_num_batched_tokens % p.tensor_parallel_size
+        )
     ):
         raise ValueError(
-            "MegaMoE requires role DP size equal to its rank count, TP/PP/CP=1, "
-            "and static contiguous FFN EP"
+            "MegaMoE requires role DP * TP equal to its rank count, PP/CP=1, "
+            "TP-aligned Attention token capacity and static FFN EP without SP"
         )
     if (
         not config.model_config.enforce_eager
@@ -107,9 +124,13 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
 class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
     @classmethod
     def parse_extra_config(cls, raw: Mapping[str, Any] | None) -> ConnectorExtraInfo:
-        if raw:
-            raise ValueError("MegaMoE eager does not take connector_extra_config")
-        return ConnectorExtraInfo()
+        raw = raw or {}
+        if set(raw) - {"attn_ranks_per_dp"}:
+            raise ValueError("Unknown MegaMoE connector_extra_config field")
+        width = raw.get("attn_ranks_per_dp")
+        if "attn_ranks_per_dp" in raw and (type(width) is not int or width < 1):
+            raise ValueError("attn_ranks_per_dp must be a positive integer")
+        return MegaMoEExtraInfo(width)
 
     def __init__(
         self,
@@ -128,6 +149,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         self.group = None
         self.buffer = None
         self.ticket = None
+        self.sequence = 0
         self.weights = {}
 
     @property
@@ -163,15 +185,42 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         )
         try:
             store = dist.PrefixStore("afd_megamoe", stores[0])
-            self.work = ExpertWorkQueue(
-                store, self.attn_size, self.ffn_size, ops.split_sequence
+            # FFN TP can differ from Attention TP. Share actual widths and check
+            # all explicit declarations before anyone enters buffer collectives.
+            attention = self.afd_config.role == "attention"
+            width = (
+                self.vllm_config.parallel_config.tensor_parallel_size
+                if attention
+                else 0
             )
+            store.set(
+                f"tp/{self.world_rank}",
+                f"{width} {self.extra_info.attn_ranks_per_dp or 0}",
+            )
+            widths = [
+                tuple(map(int, store.get(f"tp/{i}").split()))
+                for i in range(self.attn_size + self.ffn_size)
+            ]
+            self.attn_tp = widths[0][0]
+            if (
+                self.attn_size % self.attn_tp
+                or any(actual != self.attn_tp for actual, _ in widths[: self.attn_size])
+                or any(declared not in (0, self.attn_tp) for _, declared in widths)
+            ):
+                raise ValueError("Inconsistent Attention TP / attn_ranks_per_dp")
+            self.work = ExpertWorkQueue(
+                store, self.attn_size // self.attn_tp, self.ffn_size, ops.split_sequence
+            )
+            self.sequence = 0
             # Only Attention schedulers own the token limit. All window offsets
             # must be derived from the same capacity, including on FFN workers.
             if self.afd_config.role == "attention":
                 store.set(
                     f"capacity/{self.role_rank}",
-                    str(self.vllm_config.scheduler_config.max_num_batched_tokens),
+                    str(
+                        self.vllm_config.scheduler_config.max_num_batched_tokens
+                        // self.attn_tp
+                    ),
                 )
             capacity = max(
                 int(store.get(f"capacity/{dp}")) for dp in range(self.attn_size)
@@ -206,17 +255,25 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             raise RuntimeError(
                 "MegaMoE eager supports one outstanding Attention ticket"
             )
-        sequence = self.work.next_sequence(self.role_rank)
+        dp = self.role_rank // self.attn_tp
+        members = self.dp_members(dp)
+        sequence = self.ops.split_sequence(self.sequence + 1)
         self.ticket = self.ops.megamoe_dispatch_send(
             hidden_states.contiguous(),
             kwargs["topk_ids"].int().contiguous(),
             kwargs["topk_weights"].float().contiguous(),
             self.buffer,
-            [self.role_rank],
+            members,
             sequence,
         )
 
-        self.work.publish(self.role_rank, context.metadata.layer_idx, sequence)
+        self.sequence = sequence
+        if self.role_rank == members[0]:
+            self.work.publish(dp, context.metadata.layer_idx, sequence)
+
+    def dp_members(self, dp: int) -> list[int]:
+        start = dp * self.attn_tp
+        return list(range(start, start + self.attn_tp))
 
     def recv_ffn_output(
         self, ref_tensor: torch.Tensor, ubatch_idx: int = 0, **kwargs
@@ -235,7 +292,9 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             time.sleep(POLL_SECONDS)
             return
         dp, layer, sequence = item
-        self.ops.megamoe_fused_moe(*self.weights[layer], self.buffer, [dp], sequence)
+        self.ops.megamoe_fused_moe(
+            *self.weights[layer], self.buffer, self.dp_members(dp), sequence
+        )
         # Bound device submissions and retain layer tensors until fused work
         # completes. Other Attention DPs remain independently scheduled.
         torch.npu.synchronize()

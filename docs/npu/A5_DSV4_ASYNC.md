@@ -46,7 +46,7 @@ Every FFN rank consumes the descriptor, including ranks with no selected expert.
 The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
 The FFN loop drains each fused submission before selecting another descriptor,
 which bounds queued work without synchronizing independent Attention DPs.
-The validated recipe uses 2A2F. Other A/F counts use TP1 and contiguous static FFN EP in one
+The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
 MTE supernode; no DBO, graphs, MTP or EPLB. Close the roles together after draining
 requests: communication-window destruction requires the union-group barrier.
 
@@ -86,6 +86,15 @@ fields for ordinary CAM are:
 ```
 
 For MegaMoE, select `CAMAsyncMegamoeAFDConnector`, keep both booleans true,
-set the same A/F counts on both roles, and omit `connector_extra_config`.
-Attention uses DP=A and FFN uses DP=F, both with TP1, static EP, BF16 model activations and eager execution. These are
+set the same A/F counts on both roles, and optionally set `connector_extra_config.attn_ranks_per_dp` to the Attention TP width.
+Each role sets DP x TP to its own configured rank count and uses static EP, BF16 model activations and eager execution. These are
 configuration fragments, not complete deployment commands or verified recipes.
+
+For Attention DP3TP2 + FFN DP2TP1/EP2, configure 6 Attention ranks and
+2 FFN ranks on both roles. Set Attention max-num-batched-tokens to a multiple
+of 2. The three independent DP groups dispatch as [0,1], [2,3], [4,5];
+each group submits one FFN work item per layer. Plain TP partitions replicated
+token rows and gathers the combined output. Attention SP uses native local
+shards. Disable SP on FFN. FFN TP may differ from Attention TP when static EP
+assigns each rank complete local experts. This eager topology extension needs
+A5 qualification; the existing 2A2F test recipe uses TP1.
