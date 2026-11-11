@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""A5 single-stage eager MegaMoE backend for DeepSeek-V4-Flash."""
+"""A5 eager MegaMoE backend for DeepSeek-V4-Flash."""
 
 from __future__ import annotations
 
@@ -106,18 +106,21 @@ def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
             "MegaMoE requires role DP * TP equal to its rank count, PP/CP=1, "
             "TP-aligned Attention token capacity and static FFN EP without SP"
         )
+    if (p.enable_dbo or p.use_ubatching) and (
+        afd.role != "attention" or p.num_ubatches != 2
+    ):
+        raise ValueError(
+            "MegaMoE DBO requires two Attention ubatches and an unbatched FFN"
+        )
     if (
         not config.model_config.enforce_eager
         or not config.use_v2_model_runner
-        or p.enable_dbo
-        or p.use_ubatching
         or config.speculative_config is not None
         or not afd.compute_gate_on_attention
         or not afd.async_dp
     ):
         raise ValueError(
-            "MegaMoE requires eager ModelRunnerV2, async DP, "
-            "Attention routing and a single stage"
+            "MegaMoE requires eager ModelRunnerV2, async DP, Attention routing"
         )
 
 
@@ -251,14 +254,15 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         context: AFDTransferContext,
         **kwargs: torch.Tensor,
     ) -> None:
-        if self.ticket is not None or context.metadata.stage_idx != 0:
+        stage = context.metadata.stage_idx
+        if self.ticket is not None or stage not in (0, 1):
             raise RuntimeError(
                 "MegaMoE eager supports one outstanding Attention ticket"
             )
         dp = self.role_rank // self.attn_tp
         members = self.dp_members(dp)
         sequence = self.ops.split_sequence(self.sequence + 1)
-        self.ticket = self.ops.megamoe_dispatch_send(
+        ticket = self.ops.megamoe_dispatch_send(
             hidden_states.contiguous(),
             kwargs["topk_ids"].int().contiguous(),
             kwargs["topk_weights"].float().contiguous(),
@@ -267,6 +271,8 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             sequence,
         )
 
+        # The peer receive hook drains this ticket before the next send.
+        self.ticket = (stage, ticket)
         self.sequence = sequence
         if self.role_rank == members[0]:
             self.work.publish(dp, context.metadata.layer_idx, sequence)
@@ -278,11 +284,9 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
     def recv_ffn_output(
         self, ref_tensor: torch.Tensor, ubatch_idx: int = 0, **kwargs
     ) -> torch.Tensor:
-        if self.ticket is None or ubatch_idx != 0:
-            raise RuntimeError(
-                "MegaMoE combine requires the matching stage-zero ticket"
-            )
-        output = self.ops.megamoe_combine_recv(self.ticket, self.buffer)
+        if self.ticket is None or ubatch_idx != self.ticket[0]:
+            raise RuntimeError("MegaMoE combine requires the matching ubatch ticket")
+        output = self.ops.megamoe_combine_recv(self.ticket[1], self.buffer)
         self.ticket = None
         return output
 

@@ -10,7 +10,10 @@ from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("native_flag", [False, True])
-def test_native_ubatching_uses_dbo_at_every_dp_size(dp_size, native_flag):
+@pytest.mark.parametrize(
+    "connector", ["CAMAsyncAFDConnector", "CAMAsyncMegamoeAFDConnector"]
+)
+def test_native_ubatching_uses_dbo_at_every_dp_size(dp_size, native_flag, connector):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_size=dp_size,
@@ -22,7 +25,7 @@ def test_native_ubatching_uses_dbo_at_every_dp_size(dp_size, native_flag):
         ),
         additional_config={
             "afd": {
-                "connector": "CAMAsyncAFDConnector",
+                "connector": connector,
                 "role": "attention",
                 "async_dp": True,
             }

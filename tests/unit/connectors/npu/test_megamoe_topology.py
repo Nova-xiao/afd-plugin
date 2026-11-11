@@ -129,7 +129,8 @@ def test_tp_members_share_generation_and_publish_once():
         n
         for n in cls.body
         if isinstance(n, ast.FunctionDef)
-        and n.name in {"send_attn_output", "dp_members", "execute_next_experts"}
+        and n.name
+        in {"send_attn_output", "recv_ffn_output", "dp_members", "execute_next_experts"}
     ]
     tree.body = [cls]
     ns = {"torch": SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None))}
@@ -155,6 +156,19 @@ def test_tp_members_share_generation_and_publish_once():
     assert calls == [
         (members, 1) for members in ([0, 1], [2, 3], [4, 5]) for _ in range(2)
     ]
+    # A handoff must consume the owner's ticket before the peer can publish.
+    ops.megamoe_combine_recv = lambda ticket, buffer: ticket
+    for rank in ranks:
+        with pytest.raises(RuntimeError, match="matching ubatch"):
+            rank.recv_ffn_output(tensor, 1)
+        rank.recv_ffn_output(tensor, 0)
+    ctx.metadata.stage_idx = 1
+    for rank in ranks:
+        rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
+        with pytest.raises(RuntimeError, match="outstanding"):
+            rank.send_attn_output(tensor, ctx, topk_ids=tensor, topk_weights=tensor)
+        rank.recv_ffn_output(tensor, 1)
+    assert notifications[3:] == [(0, 7, 2), (1, 7, 2), (2, 7, 2)]
     for item in notifications:
         rank.work = SimpleNamespace(poll=lambda _, task=item: task)
         rank.weights = {7: ()}

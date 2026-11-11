@@ -220,7 +220,7 @@ def validate_npu_model_runner_v2_config(
         if (
             expected_role == "attention"
             and parallel.data_parallel_size <= 1
-            and afd_config.connector != AFD_ASYNC_CONNECTOR
+            and afd_config.connector not in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
         ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
         if parallel.num_ubatches != 2:

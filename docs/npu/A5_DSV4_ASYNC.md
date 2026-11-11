@@ -47,7 +47,7 @@ The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse
 The FFN loop drains each fused submission before selecting another descriptor,
 which bounds queued work without synchronizing independent Attention DPs.
 The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
-MTE supernode; no DBO, graphs, MTP or EPLB. Close the roles together after draining
+MTE supernode; no graphs, MTP or EPLB. Close the roles together after draining
 requests: communication-window destruction requires the union-group barrier.
 
 ## Operator dependencies and current limits
@@ -98,3 +98,13 @@ token rows and gathers the combined output. Attention SP uses native local
 shards. Disable SP on FFN. FFN TP may differ from Attention TP when static EP
 assigns each rank complete local experts. This eager topology extension needs
 A5 qualification; the existing 2A2F test recipe uses TP1.
+
+
+For eager MegaMoE DBO, enable `--enable-dbo` on Attention only, with two
+ubatches and native decode/prefill thresholds of at least two tokens.
+For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
+to exercise splitting with eligible requests. The two stages share one window:
+the peer receive hook submits combine for the previous owner before dispatching
+the next shard. Each dispatch advances the same per-DP generation. FFN processes
+the two work items through its ordinary fused loop. Below threshold, Attention
+uses a single stage. A5 device qualification of this DBO path is pending.
