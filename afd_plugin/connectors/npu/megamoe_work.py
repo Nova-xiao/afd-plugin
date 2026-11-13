@@ -20,7 +20,13 @@ class ExpertWorkQueue:
     """One mailbox per (Attention DP, FFN rank), each with exactly one reader."""
 
     def __init__(
-        self, store: Store, sources: int, experts: int, wrap: Callable[[int], int]
+        self,
+        store: Store,
+        sources: int,
+        experts: int,
+        wrap: Callable[[int], int],
+        *,
+        read_published: Callable[[], Sequence[Sequence[int]]] | None = None,
     ):
         self.store = store
         self.sources = sources
@@ -28,7 +34,7 @@ class ExpertWorkQueue:
         self.wrap = wrap
         self.last = [0] * sources
         self.cursor = 0
-        self.read_published: Callable[[], Sequence[Sequence[int]]] | None = None
+        self.read_published = read_published
 
     def next_sequence(self, source: int) -> int:
         return self.wrap(self.last[source] + 1)

@@ -12,19 +12,27 @@ work = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(work)
 
 
-def queue(published):
+def queue(published=None):
     keys = {}
     store = Mock()
     store.set = keys.__setitem__
     store.get = keys.__getitem__
     store.check = lambda names: all(key in keys for key in names)
     store.delete_key = keys.__delitem__
-    result = work.ExpertWorkQueue(store, len(published), 1, lambda n: (n - 1) % 32 + 1)
-    result.read_published = Mock(return_value=published)
-    return result
+    return work.ExpertWorkQueue(
+        store, len(published) if published is not None else 1, 1,
+        lambda n: (n - 1) % 32 + 1,
+        read_published=Mock(return_value=published) if published is not None else None,
+    )
 
 
 class TestMegaMoEAdmission(unittest.TestCase):
+    def test_single_window_claims_without_device_snapshot(self):
+        reader = queue()
+        reader.store.set("work/0/0", "42 1")
+        self.assertEqual(reader.poll(0), (0, 42, 1))
+        self.assertIsNone(reader.poll(0))
+
     def test_two_lanes_at_batch_boundary(self):
         lane0 = queue([[0], [0], [26]])
         lane1 = queue([[0], [0], [4]])

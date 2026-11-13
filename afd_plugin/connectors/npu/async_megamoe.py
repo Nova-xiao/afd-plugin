@@ -298,13 +298,14 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                         self.attn_size // self.attn_tp,
                         self.ffn_size,
                         ops.split_sequence,
+                        read_published=(
+                            _PublishedWords(buffer, self.attn_size, self.attn_tp)
+                            if dual_stage and not attention
+                            else None
+                        ),
                     ),
                 )
                 self.stages.append(lane)
-                if not attention:
-                    lane.work.read_published = _PublishedWords(
-                        buffer, self.attn_size, self.attn_tp
-                    )
                 if dual_stage and not attention:
                     lane.stream = torch.npu.Stream()
                     lane.stream.wait_stream(torch.npu.current_stream())
