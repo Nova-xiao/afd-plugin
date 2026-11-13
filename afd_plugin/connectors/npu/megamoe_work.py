@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from torch.distributed import Store
 
@@ -28,6 +28,7 @@ class ExpertWorkQueue:
         self.wrap = wrap
         self.last = [0] * sources
         self.cursor = 0
+        self.read_published: Callable[[], Sequence[Sequence[int]]] | None = None
 
     def next_sequence(self, source: int) -> int:
         return self.wrap(self.last[source] + 1)
@@ -44,6 +45,7 @@ class ExpertWorkQueue:
         self.last[source] = sequence
 
     def poll(self, ffn: int) -> tuple[int, int, int] | None:
+        published = None
         for offset in range(self.sources):
             source = (self.cursor + offset) % self.sources
             key = f"work/{source}/{ffn}"
@@ -51,6 +53,14 @@ class ExpertWorkQueue:
                 layer, sequence = map(int, self.store.get(key).split())
                 if sequence != self.next_sequence(source):
                     raise RuntimeError(f"Out-of-order MegaMoE work in {key}")
+                if self.read_published is not None:
+                    if published is None:
+                        # Take one fresh snapshot per scan, only when work exists.
+                        published = self.read_published()
+                    # The producer needs TAKEN from this FFN to reuse the slot,
+                    # so an unclaimed generation cannot already be superseded.
+                    if any(word != sequence for word in published[source]):
+                        continue
                 self.store.delete_key(key)
                 self.last[source] = sequence
                 self.cursor = (source + 1) % self.sources

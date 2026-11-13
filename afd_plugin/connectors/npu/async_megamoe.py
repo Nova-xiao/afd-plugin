@@ -52,6 +52,29 @@ class MegaMoEStage:
     completion: Any = None
 
 
+class _PublishedWords:
+    """Read local PUBLISHED words without queuing behind an FFN compute stream."""
+
+    def __init__(self, buffer, attention_ranks: int, tp: int):
+        exception_bytes = dict(buffer.layout.sections)["exception"]
+        window = buffer.manager.get_local_buffer_tensor(
+            torch.int32, exception_bytes // 4
+        )
+        # UMDK SplitWord: one 64-byte control row per union rank, PUBLISHED at word 0.
+        self.rows = window[: attention_ranks * 16].view(attention_ranks, 16)
+        self.host = torch.empty(self.rows.shape, dtype=torch.int32, pin_memory=True)
+        self.stream = torch.npu.Stream(device=window.device)
+        self.tp = tp
+
+    def __call__(self) -> list[list[int]]:
+        # Copy contiguous rows with DMA. Strided gathers would launch a device
+        # kernel that could contend with the very fused work we are scheduling.
+        with torch.npu.stream(self.stream):
+            self.host.copy_(self.rows, non_blocking=True)
+        self.stream.synchronize()
+        return self.host[:, 0].reshape(-1, self.tp).tolist()
+
+
 def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
     hf = config.model_config.hf_config
     if (
@@ -278,6 +301,10 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                     ),
                 )
                 self.stages.append(lane)
+                if not attention:
+                    lane.work.read_published = _PublishedWords(
+                        buffer, self.attn_size, self.attn_tp
+                    )
                 if dual_stage and not attention:
                     lane.stream = torch.npu.Stream()
                     lane.stream.wait_stream(torch.npu.current_stream())
