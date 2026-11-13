@@ -37,6 +37,8 @@ from afd_plugin.model_executor.models.npu.async_cam_dbo import (
     send_async_cam_remote_call,
 )
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    CAMDispatchPayload,
+    plain_tp_layout,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
@@ -269,22 +271,69 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
+        from vllm.distributed.parallel_state import get_tp_group
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
+        tp = (
+            get_tp_group()
+            if self.megamoe and not self.use_sequence_parallel_moe
+            else None
         )
-        dispatch_payload = prepare_cam_dispatch_payload(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            None,
-            use_sequence_parallel=self.use_sequence_parallel_moe,
-            distinct_padding_ids=self.megamoe,
-        )
+        if tp is not None and tp.world_size > 1 and not _EXTRA_CTX.in_profile_run:
+            layout = plain_tp_layout(
+                hidden_states.shape[0], tp.rank_in_group, tp.world_size
+            )
+            rows = layout.local_token_slice
+            local_hidden = hidden_states[rows]
+            valid = local_hidden.shape[0]
+            pad = layout.local_tokens - valid
+            if self.gate.tid2eid is not None:
+                if input_ids is None:
+                    input_ids = get_forward_context().input_ids
+                input_ids = deepseek_v4_attention_gate.local_hash_input_ids(
+                    input_ids=input_ids, router_tokens=hidden_states.shape[0]
+                )[rows]
+            if valid:
+                weights, ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    local_hidden,
+                    input_ids=input_ids,
+                    hidden_states_fp32=None
+                    if hidden_states_fp32 is None
+                    else hidden_states_fp32[rows],
+                )
+            else:
+                weights = hidden_states.new_empty((0, self.top_k), dtype=torch.float32)
+                ids = hidden_states.new_empty((0, self.top_k), dtype=torch.int32)
+            if pad:
+                local_hidden = torch.nn.functional.pad(local_hidden, (0, 0, 0, pad))
+                weights = torch.nn.functional.pad(weights, (0, 0, 0, pad))
+                padding_ids = torch.arange(
+                    self.top_k, device=ids.device, dtype=ids.dtype
+                )
+                ids = torch.cat((ids, padding_ids.expand(pad, -1)))
+            dispatch_payload = CAMDispatchPayload(
+                local_hidden, weights, ids, None, layout
+            )
+        else:
+            topk_weights, topk_ids = (
+                deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    hidden_states,
+                    input_ids=input_ids,
+                    hidden_states_fp32=hidden_states_fp32,
+                )
+            )
+            dispatch_payload = prepare_cam_dispatch_payload(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                None,
+                use_sequence_parallel=self.use_sequence_parallel_moe,
+                distinct_padding_ids=self.megamoe,
+            )
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Async CAM requires AFD forward metadata")

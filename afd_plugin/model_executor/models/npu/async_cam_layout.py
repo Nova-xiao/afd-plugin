@@ -47,6 +47,24 @@ class CAMDispatchPayload:
     layout: CAMDispatchLayout
 
 
+def plain_tp_layout(
+    parent_tokens: int, tp_rank: int, tp_size: int
+) -> CAMDispatchLayout:
+    local_tokens = (parent_tokens + tp_size - 1) // tp_size
+    padded_tokens = local_tokens * tp_size
+    local_start = tp_rank * local_tokens
+    local_token_slice = slice(local_start, local_start + local_tokens)
+    return CAMDispatchLayout(
+        parent_tokens=parent_tokens,
+        padded_tokens=padded_tokens,
+        local_token_slice=local_token_slice,
+        requires_tp_all_gather=True,
+        use_sequence_parallel=False,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+
+
 def prepare_cam_dispatch_payload(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -104,19 +122,9 @@ def prepare_cam_dispatch_payload(
             layout=layout,
         )
 
-    local_tokens = (parent_tokens + tp_size - 1) // tp_size
-    padded_tokens = local_tokens * tp_size
-    local_start = tp_rank * local_tokens
-    local_token_slice = slice(local_start, local_start + local_tokens)
-    layout = CAMDispatchLayout(
-        parent_tokens=parent_tokens,
-        padded_tokens=padded_tokens,
-        local_token_slice=local_token_slice,
-        requires_tp_all_gather=True,
-        use_sequence_parallel=False,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-    )
+    layout = plain_tp_layout(parent_tokens, tp_rank, tp_size)
+    padded_tokens = layout.padded_tokens
+    local_token_slice = layout.local_token_slice
     _log_cam_layout("dispatch", layout)
     padded_ids = _pad_first_dim(topk_ids, padded_tokens)
     if distinct_padding_ids and padded_tokens > parent_tokens:
