@@ -12,6 +12,7 @@ from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
     CAMP2P_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
+    MEGAMOE_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -228,6 +229,15 @@ def validate_npu_model_runner_v2_config(
                 validate_async_cam_attention_graph(vllm_config)
             else:
                 requested_ffn_mode(vllm_config)
+    elif afd_config.connector == MEGAMOE_CONNECTOR:
+        if (
+            not afd_config.async_dp
+            or not vllm_config.model_config.enforce_eager
+            or not afd_config.compute_gate_on_attention
+        ):
+            raise RuntimeError(
+                "MegaMoE requires eager execution, async DP and Attention routing"
+            )
     elif afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "AFD NPU ModelRunnerV2 requires either synchronous CAMP2pAFDConnector "
@@ -270,7 +280,7 @@ def validate_npu_model_runner_v2_config(
         if (
             expected_role == "attention"
             and parallel.data_parallel_size <= 1
-            and afd_config.connector != AFD_ASYNC_CONNECTOR
+            and afd_config.connector not in (AFD_ASYNC_CONNECTOR, MEGAMOE_CONNECTOR)
         ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
         if parallel.num_ubatches != 2:
