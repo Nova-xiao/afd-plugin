@@ -57,6 +57,8 @@ logger = init_logger(__name__)
 
 class FFNModel(Protocol):
     def get_experts_layer_indices(self) -> tuple[int, ...]: ...
+    def get_mxfp_expert_layers(self) -> list[tuple[int, torch.nn.Module]]: ...
+
     def get_quantized_expert_weights(
         self,
     ) -> tuple[list[QuantizedExpertWeights], str]: ...
@@ -84,6 +86,7 @@ class AsyncNPUFFNModelRunner:
         self.layer_ids: tuple[int, ...] = ()
         self._layered_executor: AsyncCAMLayeredExecutor | None = None
         self._mega_executor: AsyncCAMMegaExecutor | None = None
+        self._mxfp_executor = None
         self.session = self.connector.ffn_session()
         self._first_step = True
         self.requested_mode = requested_ffn_mode(vllm_config)
@@ -342,6 +345,25 @@ class AsyncNPUFFNModelRunner:
 
     def _initialize_ffn_executor(self) -> str:
         assert self.model is not None
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            from afd_plugin.connectors.npu.async_cam_runtime.async_cam_mxfp import (
+                AsyncCAMMXFPExecutor,
+            )
+
+            if (
+                self.requested_mode != "eager"
+                or self.draft_model is not None
+                or self.connector.dynamic_quant != 0
+                or self.connector.extra_info.ffn_mega_moe
+            ):
+                raise ValueError("A5 MXFP CAM requires eager BF16 Push without draft")
+            self._mxfp_executor = AsyncCAMMXFPExecutor(
+                self.model.get_mxfp_expert_layers()
+            )
+            if tuple(sorted(self._mxfp_executor.layers)) != self.layer_ids:
+                raise ValueError("MXFP weights do not cover remote expert layers")
+            ensure_cam_async_ops_available()
+            return self._mxfp_executor.signature()
         layers, reason = self.model.get_quantized_expert_weights()
         if not layers:
             raise ValueError(f"layered GMM target weights are unsupported: {reason}")
@@ -430,11 +452,12 @@ class AsyncNPUFFNModelRunner:
                 rank_ffn_output = self._mega_executor()
             return rank_ffn_output
         rank_ffn_output = None
-        assert self._layered_executor is not None
+        executor = self._mxfp_executor or self._layered_executor
+        assert executor is not None
         for _ in self.layer_ids[:1] if single else self.layer_ids:
             payload = self.connector.recv_attn_output()
             states = cast(AFDAsyncTransferState, payload.context.states)
-            rank_ffn_output = self._layered_executor(
+            rank_ffn_output = executor(
                 payload.hidden_states,
                 states.dynamic_scales,
                 states.group_list,
@@ -475,6 +498,7 @@ class AsyncNPUFFNModelRunner:
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
         self._mega_executor = None
+        self._mxfp_executor = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None

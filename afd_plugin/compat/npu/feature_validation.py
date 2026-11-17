@@ -170,6 +170,8 @@ def _fail_if_unsupported_dsv4_async_features(
             or not vllm_config.model_config.enforce_eager
             or vllm_config.parallel_config.enable_eplb
             or async_cam_layered_gmm_enabled()
+            or extra_info.ffn_mega_moe
+            or vllm_config.speculative_config is not None
             or vllm_config.additional_config.get("enable_fused_mc2", 0)
         ):
             raise RuntimeError(
