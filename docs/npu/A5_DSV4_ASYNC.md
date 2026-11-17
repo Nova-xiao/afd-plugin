@@ -4,7 +4,7 @@
 
 The PR branch `feat/a5-async-with-megamoe` starts at upstream `main`, commit
 `0d6ec9e`, and carries the A5 work from `feature/a5-async-megamoe` (`9dcb69b`).
-It targets the
+The branch also merges upstream `main@3dc2347` (#600 and #601). It targets the
 [#537](https://github.com/vllm-project/afd-plugin/issues/537) software environment:
 
 | Component | Target |
@@ -26,6 +26,22 @@ that runtime; the A3 layered and Pull-Mega executors remain unchanged. No new
 launch option is needed. The source branch was verified on A5; this main-based
 integration still requires a fresh A5 build and E2E run. Host tests do not
 validate NPU execution or accuracy.
+
+## Main merge validation (2026-11-17)
+
+The #600 merge keeps Worker deployment admission and the shared FFN transaction.
+A5 BF16 CAM uses the MXFP executor without receive scales; A3 keeps the layered
+executor and graph tensor retention. MegaMoE remains eager-only and accepts
+Attention DBO with exactly two ubatches, including DP1/TP2.
+
+Host regression results: 576 passed, 3 skipped, 10 subtests passed across config,
+NPU compatibility and connector tests; 43 passed, 1 skipped across selected build,
+DSV4 layout and runtime tests. These do not establish device correctness.
+
+The #601 CAM dispatch staging/pipelining optimization is retained alongside the
+A5 HCCL context and barrier adaptations. Rebuild the bundled operators and rerun
+A5 CAM precision/E2E tests before comparing performance; the split MegaMoE
+kernels are not changed by #601. The runtime pins above are unchanged.
 
 ## Two execution paths
 

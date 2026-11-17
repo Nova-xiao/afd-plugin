@@ -15,6 +15,7 @@ from afd_plugin.validation import (
     NPU_ATTENTION_WORKER_FQCN,
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
+    cam_receive_capacity,
     validate_gpu_model_runner_v2_config,
     validate_npu_model_runner_v2_config,
 )
@@ -677,6 +678,53 @@ _NPU_GRAPH = {
         pytest.param(
             {
                 **_NPU_ASYNC,
+                "afd.role": "ffn",
+                "model.enforce_eager": False,
+                "comp.cudagraph_mode": SimpleNamespace(name="FULL"),
+            },
+            None,
+            id="accept-async-ffn-full",
+        ),
+        pytest.param(
+            {**_NPU_ASYNC, "par.enable_dbo": True, "par.num_ubatches": 2},
+            None,
+            id="accept-async-attention-dbo",
+        ),
+        pytest.param(
+            {
+                **_NPU_ASYNC,
+                "afd.role": "ffn",
+                "par.use_ubatching": True,
+                "par.num_ubatches": 2,
+            },
+            _err("requires the Attention role"),
+            id="reject-async-ffn-dbo-before-model-registration",
+        ),
+        pytest.param(
+            {
+                **_NPU_ASYNC,
+                "afd.role": "ffn",
+                "model.enforce_eager": False,
+                "comp.cudagraph_mode": SimpleNamespace(name="FULL"),
+                "par.tensor_parallel_size": 2,
+                "afd.num_ffn_ranks": 2,
+            },
+            _err("requires F TP=1"),
+            id="reject-async-ffn-full-tp2-before-model-registration",
+        ),
+        pytest.param(
+            {
+                **_NPU_ASYNC,
+                "par.use_ubatching": True,
+                "par.num_ubatches": 2,
+                "speculative_config": object(),
+            },
+            _err("does not support speculative decoding"),
+            id="reject-async-dbo-speculative-before-model-registration",
+        ),
+        pytest.param(
+            {
+                **_NPU_ASYNC,
                 "afd.num_attention_ranks": 4,
                 "par.data_parallel_size": 2,
                 "par.tensor_parallel_size": 2,
@@ -799,3 +847,62 @@ def test_npu_v2_validator_outcome(mrv2_config, overrides, error):
             expected_role=call["expected_role"],
             device_type=call["device_type"] or "npu",
         )
+
+
+@pytest.mark.parametrize(
+    "factor,capacity,error",
+    [
+        (None, 262144, None),
+        ("1", 262144, None),
+        ("0.000061035156249", 16, None),
+        ("0.000003814697265625", 1, None),
+        ("0.0000038146972", 1, None),
+        ("0.000003814697", None, "at least one receive row"),
+        *[
+            (value, None, "decimal number")
+            for value in (
+                "",
+                "invalid",
+                "0",
+                "-1",
+                "1.00000001",
+                "nan",
+                "inf",
+                "0.01_5625",
+                "０.５",
+            )
+        ],
+        ("1e-50", None, "at least one receive row"),
+    ],
+)
+def test_cam_receive_capacity_validates_native_float32_envelope(
+    monkeypatch, factor, capacity, error
+):
+    if factor is None:
+        monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
+    else:
+        monkeypatch.setenv("BATCH_SIZE_FACTOR", factor)
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            cam_receive_capacity()
+    else:
+        assert cam_receive_capacity() == capacity
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (1, 2), (2, 2)])
+def test_megamoe_eager_dbo_admits_attention_topology(
+    monkeypatch, mrv2_config, dp_size, tp_size
+):
+    config = npu_async_cam_target_graph_config(
+        data_parallel_size=dp_size,
+        tensor_parallel_size=tp_size,
+        num_attention_ranks=dp_size * tp_size,
+    )
+    config.additional_config["afd"]["connector"] = "CAMAsyncMegamoeAFDConnector"
+    config.model_config.enforce_eager = True
+    config.parallel_config.enable_dbo = True
+    config.parallel_config.use_ubatching = True
+    config.parallel_config.num_ubatches = 2
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )
