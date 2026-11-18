@@ -92,9 +92,9 @@ protected:
             Duplicate<int32_t>(zeros, 0, DISPATCH_RESET_BATCH);
             ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, DISPATCH_RESET_BATCH, zeros);
             if (GetSubBlockIdx() == 1U) {
-                auto *progress = reinterpret_cast<__gm__ int32_t *>(params_.peermemInfo.rankSyncInWorldPtr + 48U * 1024U);
-                // Invalidate this core's done tag before the existing launch barrier.
-                WriteGmByPassDCache(progress + blockIdx_ * 16U, 0);
+                auto *progress = reinterpret_cast<__gm__ int32_t *>(params_.peermemInfo.rankSyncInWorldPtr + CamMegamoe::SplitProgressOffset(params_.tilingData->epWorldSize));
+                // Only local combine progress is reset. Remote per-reader TAKEN
+                // persists across launches and is never cleared here.
                 WriteGmByPassDCache(progress + blockIdx_ * 16U + 1U, 0);
             }
             PipeBarrier<PIPE_ALL>();
@@ -525,8 +525,7 @@ __aicore__ inline void MegamoeFusedMoe<TemplateMegamoeFusedMoeTypeFunc>::Process
         SyncAll<true>();
         if (aivCoreIdx_ == 0U) {
             for (uint32_t member = 0; member < params_.tilingData->splitDpSize; ++member) {
-                // All input readers have drained. Reaffirm TAKEN because the
-                // nonblocking early fan-in may miss its last writer.
+                // Legacy aggregate acknowledgement only; dispatch waits on per-reader slots.
                 SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_TAKEN);
                 SplitPublish(params_, g_winRankAddr_, params_.tilingData->splitDpRanks[member], SPLIT_READY);
             }

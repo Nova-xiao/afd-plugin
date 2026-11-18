@@ -212,9 +212,17 @@ __aicore__ inline void MegamoeDispatchSend<TemplateMegamoeDispatchSendTypeFunc>:
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
     if constexpr (g_coreType == AIV) {
         const auto *td = params_.tilingData;
-        for (uint32_t owner = td->splitAttentionRanks; owner < worldSize_; ++owner) {
-            SplitWait(SplitWord(params_.peermemInfo.rankSyncInWorldPtr, owner, SPLIT_TAKEN), td->splitSequence, true);
+        // Partition checks over local AIVs. All checks must pass before ANY AIV
+        // can overwrite the input window, including route/count metadata.
+        const uint32_t checks = td->splitMoeRanks * CamMegamoe::SPLIT_TAKEN_SLOTS;
+        for (uint32_t check = aivCoreIdx_; check < checks; check += blockAivNum_) {
+            const uint32_t owner = td->splitAttentionRanks + check / CamMegamoe::SPLIT_TAKEN_SLOTS;
+            const uint32_t slot = check % CamMegamoe::SPLIT_TAKEN_SLOTS;
+            auto *word = reinterpret_cast<__gm__ int32_t *>(params_.peermemInfo.rankSyncInWorldPtr +
+                CamMegamoe::SplitTakenOffset(owner, slot));
+            SplitWait(word, td->splitSequence, true);
         }
+        SyncAll<true>();
         params_.workspaceInfo.sharedExpertInputDataPtr = snapshotData;
         params_.workspaceInfo.sharedExpertInputScalePtr = snapshotScale;
         SendAndQuantBuffInit();

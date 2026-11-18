@@ -66,17 +66,23 @@ class _PublishedWords:
         window = buffer.manager.get_local_buffer_tensor(
             torch.int32, exception_bytes // 4
         )
-        # UMDK SplitWord: one 64-byte control row per union rank, PUBLISHED at word 0.
-        self.rows = window[: attention_ranks * 16].view(attention_ranks, 16)
-        self.host = torch.empty(self.rows.shape, dtype=torch.int32, pin_memory=True)
+        # SplitWord uses an expanded peer row; PUBLISHED remains at word zero.
+        peer_words = buffer.layout.peer_bytes // 4
+        self.rows = tuple(
+            window[rank * peer_words : rank * peer_words + 16]
+            for rank in range(attention_ranks)
+        )
+        self.host = torch.empty((attention_ranks, 16), dtype=torch.int32, pin_memory=True)
         self.stream = torch.npu.Stream(device=window.device)
         self.tp = tp
 
     def __call__(self) -> list[list[int]]:
-        # Copy contiguous rows with DMA. Strided gathers would launch a device
+        # Copy only each 64-byte header with DMA, not its 192 TAKEN slots.
+        # Strided gathers would launch a device
         # kernel that could contend with the very fused work we are scheduling.
         with torch.npu.stream(self.stream):
-            self.host.copy_(self.rows, non_blocking=True)
+            for rank, row in enumerate(self.rows):
+                self.host[rank].copy_(row, non_blocking=True)
         self.stream.synchronize()
         return self.host[:, 0].reshape(-1, self.tp).tolist()
 

@@ -17,6 +17,7 @@
 
 #pragma once
 #include "megamoe_sequence_ring.h"
+#include "megamoe_control_layout.h"
 
 namespace MegamoeCombineRecvImpl {
 
@@ -28,7 +29,7 @@ constexpr uint32_t SPLIT_READY = 2U;
 constexpr uint32_t SPLIT_CONSUMED = 3U;
 __aicore__ inline __gm__ int32_t *SplitWord(GM_ADDR window, uint32_t peer, uint32_t field)
 {
-    return reinterpret_cast<__gm__ int32_t *>(window + static_cast<uint64_t>(peer) * 64U + field * 4U);
+    return reinterpret_cast<__gm__ int32_t *>(window + static_cast<uint64_t>(peer) * CamMegamoe::SPLIT_PEER_BYTES + field * 4U);
 }
 __aicore__ inline void SplitWait(__gm__ int32_t *word, uint32_t sequence, bool previous = false)
 {
@@ -49,19 +50,17 @@ __aicore__ inline void SplitPublish(const Params &params, GM_ADDR *windows, uint
     WriteGmByPassDCache(SplitWord(windows[peer], params.tilingData->splitRank, field),
                        static_cast<int32_t>(params.tilingData->splitSequence));
 }
-// Nonblocking fan-in: the last AIV1 to finish all of its pulls publishes the ACK.
-// No AIC waits for this fan-in, so it does not cut the existing tile pipeline.
+// Each input reader owns disjoint slots. Padding slots are assigned round-robin
+// too, so the receiver never needs to infer the remote device's reader count.
 __aicore__ inline void SplitDispatchTaken(const Params &params, GM_ADDR *windows, uint32_t block, uint32_t blocks)
 {
     const auto *td = params.tilingData;
-    GM_ADDR own = params.peermemInfo.rankSyncInWorldPtr;
-    auto *done = reinterpret_cast<__gm__ int32_t *>(own + 48U * 1024U);
-    WriteGmByPassDCache(done + block * 16U, static_cast<int32_t>(td->splitLaunch));
-    for (uint32_t index = 0; index < blocks; ++index) {
-        if (static_cast<uint32_t>(ReadGmByPassDCache(done + index * 16U)) != td->splitLaunch) { return; }
-    }
-    for (uint32_t index = 0; index < td->splitDpSize; ++index) {
-        SplitPublish(params, windows, td->splitDpRanks[index], SPLIT_TAKEN);
+    for (uint32_t member = 0; member < td->splitDpSize; ++member) {
+        for (uint32_t slot = block; slot < CamMegamoe::SPLIT_TAKEN_SLOTS; slot += blocks) {
+            auto *word = reinterpret_cast<__gm__ int32_t *>(
+                windows[td->splitDpRanks[member]] + CamMegamoe::SplitTakenOffset(td->splitRank, slot));
+            WriteGmByPassDCache(word, static_cast<int32_t>(td->splitSequence));
+        }
     }
 }
 __aicore__ inline void SplitWaitOutputSlot(const Params &params, uint32_t source)
@@ -79,7 +78,7 @@ __aicore__ inline void SplitCombineProgress(const Params &params, GM_ADDR *windo
                                            __gm__ int32_t *prefix)
 {
     const auto *td = params.tilingData;
-    auto *progress = reinterpret_cast<__gm__ int32_t *>(params.peermemInfo.rankSyncInWorldPtr + 48U * 1024U);
+    auto *progress = reinterpret_cast<__gm__ int32_t *>(params.peermemInfo.rankSyncInWorldPtr + CamMegamoe::SplitProgressOffset(params.tilingData->epWorldSize));
     WriteGmByPassDCache(progress + block * 16U + 1U, static_cast<int32_t>(completedRows));
     uint32_t commonEnd = completedRows;
     for (uint32_t index = 0; index < blocks; ++index) {

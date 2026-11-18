@@ -43,12 +43,13 @@
 #include "megamoe_dispatch_send_constants.h"
 // ### PATCH START: AFD merged source layout
 #include "megamoe_layer_selection.h"
+#include "megamoe_control_layout.h"
 // ### PATCH END: AFD merged source layout
 
 namespace MegamoeDispatchSendImpl {
 
 // 原同步布局：前 48 KiB 是 rank 槽位，随后 12 KiB 是各 AIV 的同步计数区。
-// URMA 的 rank 槽位超过预留区时动态扩展；MTE 保持原 60 KiB 固定布局。
+// MTE peer slots include per-reader TAKEN; progress follows the expanded peer region.
 constexpr int64_t PEERMEM_MIN_RANK_SYNC_SIZE = 1024 * 48LL;
 constexpr int64_t PEERMEM_DATA_OFFSET = 1024 * 60LL;
 constexpr int64_t PEERMEM_SYNC_COUNT_REGION_SIZE = PEERMEM_DATA_OFFSET - PEERMEM_MIN_RANK_SYNC_SIZE;
@@ -69,7 +70,7 @@ HOST_DEVICE int64_t CalcPeermemDataOffset(int64_t topoType, int64_t epWorldSize)
     if (topoType == TOPO_TYPE_URMA) {
         return Ops::Base::CeilAlign(CalcUrmaSyncCountOffset(epWorldSize) + PEERMEM_SYNC_COUNT_REGION_SIZE, ALIGN_512);
     }
-    return PEERMEM_DATA_OFFSET;
+    return CamMegamoe::SplitControlBytes(epWorldSize);
 }
 
 // ============================ 各区尺寸（host / device 共用） ============================

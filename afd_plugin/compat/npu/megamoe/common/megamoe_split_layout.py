@@ -7,6 +7,12 @@ def align(value, multiple):
     return (value + multiple - 1) // multiple * multiple
 
 
+SPLIT_TAKEN_SLOTS = 192
+SPLIT_PEER_BYTES = 64 * (1 + SPLIT_TAKEN_SLOTS)
+SPLIT_MIN_PEER_REGION_BYTES = 48 * 1024
+SPLIT_PROGRESS_BYTES = 12 * 1024
+
+
 @dataclass(frozen=True)
 class SplitLayout:
     attention_ranks: int
@@ -35,6 +41,18 @@ class SplitLayout:
         return self.experts // self.moe_ranks
 
     @property
+    def peer_bytes(self):
+        return SPLIT_PEER_BYTES
+
+    @property
+    def control_bytes(self):
+        return align(
+            max(SPLIT_MIN_PEER_REGION_BYTES, self.world_size * self.peer_bytes)
+            + SPLIT_PROGRESS_BYTES,
+            512,
+        )
+
+    @property
     def sections(self):
         route_stride = align(self.capacity * 4, 32)
         record_bytes = align(self.hidden, 256) + align((self.hidden + 31) // 32, 32)
@@ -45,7 +63,7 @@ class SplitLayout:
             result_bytes = align(align(self.hidden, 256) + align((self.hidden + 31) // 32, 2), 32)
         return (
             ("exception", 60 * 1024),
-            ("control", 60 * 1024),
+            ("control", self.control_bytes),
             ("routes", align(self.local_experts * self.world_size * route_stride, 512)),
             ("route_task_meta", align(self.world_size * 64, 512)),
             ("counts", align(self.local_experts * self.world_size * 4, 512)),

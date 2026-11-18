@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. Licensed under CANN OSL v2.
 """Exercise the device's actual arithmetic on the host, independently of CANN."""
 
+import importlib.util
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -58,3 +60,43 @@ int main()
                 check=True,
             )
             subprocess.run([str(exe)], check=True)
+
+
+class ControlLayoutTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("c++"), "requires a host C++ compiler")
+    def test_python_allocation_contains_device_control_and_payload(self):
+        """The device offsets must agree with the Python registered-window ABI."""
+        path = SUPPORT.parents[3] / "afd_plugin/compat/npu/megamoe/common/megamoe_split_layout.py"
+        spec = importlib.util.spec_from_file_location("taken_layout_test", path)
+        layout = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = layout
+        try:
+            spec.loader.exec_module(layout)
+        finally:
+            del sys.modules[spec.name]
+        source = r"""
+#include "megamoe_control_layout.h"
+#include <cassert>
+#include <iostream>
+int main() {
+    using namespace CamMegamoe;
+    for (int ranks = 2; ranks <= 768; ++ranks) {
+        auto end = SplitTakenOffset(ranks - 1, SPLIT_TAKEN_SLOTS - 1) + 64;
+        assert(end <= SplitProgressOffset(ranks));
+        assert(SplitProgressOffset(ranks) + SPLIT_PROGRESS_BYTES <= SplitControlBytes(ranks));
+        std::cout << ranks << " " << SPLIT_PEER_BYTES << " " << SplitControlBytes(ranks) << "\n";
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "control_layout"
+            subprocess.run(["c++", "-std=c++11", "-I", str(SUPPORT), "-x", "c++",
+                            "-", "-o", str(exe)], input=source, text=True, check=True)
+            rows = subprocess.check_output([str(exe)], text=True).splitlines()
+        for row in rows:
+            ranks, peer_bytes, control_bytes = map(int, row.split())
+            geometry = layout.SplitLayout(ranks - 1, 1, 1, 16, 4096, 1)
+            self.assertEqual(geometry.peer_bytes, peer_bytes)
+            self.assertEqual(dict(geometry.sections)["control"], control_bytes)
+            self.assertEqual(geometry.buffer_bytes, sum(size for _, size in geometry.sections))
+        self.assertEqual(layout.SplitLayout(4, 4, 256, 16, 4096, 6).control_bytes, 108 * 1024 + 512)

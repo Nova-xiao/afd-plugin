@@ -145,3 +145,53 @@ the connector allocates one window and uses the original serial FFN loop.
 To verify hardware overlap, profile eligible batches after warmup and compare
 the two FFN streams' fused kernel intervals. Concurrent host submission alone
 does not establish simultaneous AIC/AIV execution or a throughput gain.
+
+## Experimental per-reader TAKEN branch (2026-11-18)
+
+Branch `feat/a5-megamoe-per-aiv-taken` changes the split MegaMoE wire layout.
+Rebuild and reinstall **both the bundled operators and this plugin**, then restart
+all Attention/FFN processes together. Do not mix this branch's Python package or
+operators with the previous 64-byte-peer ABI. The CANN 9.2.1 environment and recipe
+arguments remain unchanged; the registered window size is calculated automatically.
+This experiment is separate from the upstream PR branch.
+
+Each peer row now contains the original 64-byte header followed by 192 independent
+64-byte TAKEN slots (12,352 bytes per peer). The rank area is
+`max(48 KiB, world_size * 12352)`; the existing 12 KiB local progress area follows
+it, and the payload starts at the next 512-byte boundary. The exception region
+remains 60 KiB. At eight ranks the control region grows from 60 KiB to 108.5 KiB:
+48.5 KiB per rank/lane, or 776 KiB across eight ranks with two lanes.
+
+Each input reader writes its own round-robin subset of the 192 slots after its
+existing input-drain barrier. For example, 64 readers each publish three slots;
+192 readers each publish one. This fixed capacity removes any dependency on the
+receiver knowing the sender's reader count. Empty readers also acknowledge.
+These remote words retain `splitSequence` and are never reset per launch.
+
+Dispatch distributes the checks across its AIVs, waits for the preceding sequence
+from every FFN/slot, then performs a local AIV barrier **before** overwriting input
+or route metadata. It uses the existing ring comparison, including first use and
+32-to-1 wrap. The FFN no longer scans other readers to elect an aggregate publisher.
+The old aggregate TAKEN at finalization is retained for diagnostics only and cannot
+release the new dispatch. READY/CONSUMED semantics and separate ubatch windows remain.
+
+The CPU admission reader uses the new peer stride and copies only the 64-byte
+headers using individual DMA copies. It does not copy all TAKEN slots or launch a
+strided-gather NPU kernel. This increases the number of small DMA submissions;
+measure admission cost along with the extra acknowledgement writes and dispatch
+barrier. This branch is a correctness-oriented experiment, not a demonstrated
+performance improvement.
+
+Local validation: the host C++ sequence test and Python/device control-layout ABI
+check passed (all world sizes 2–768); four existing admission tests passed. The
+layout check verifies that the last TAKEN slot cannot overlap progress or payload.
+The `test_megamoe_work.py` suite could not run because this host lacks pytest.
+There is no CANN compiler or NPU on this host; device build, memory ordering,
+accuracy and performance remain unverified.
+
+On A5, first run the existing split-op accuracy tests and E2E recipe, including
+TP1/TP2, DBO on/off, empty routes, and more than 64 consecutive layer calls per lane
+(to cover repeated sequence wrap). Then compare the same RPS/batch/topology against
+the base branch: dispatch wait, FFN duration, admission delay and TTFT. No changes
+to native MegaMoE are required for the baseline. A passing E2E run alone does not
+prove that the early-acknowledgement path improved overlap.
