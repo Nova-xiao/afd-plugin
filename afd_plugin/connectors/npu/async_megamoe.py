@@ -19,12 +19,10 @@ from afd_plugin.connectors.npu.megamoe_layers import (
     agree_layer_selection,
     pack_layer_weights,
 )
-from afd_plugin.connectors.npu.megamoe_work import POLL_SECONDS, ExpertWorkQueue
 from afd_plugin.distributed.afd_process_group import (
     DefaultProcessGroupSwitcher,
     init_afd_process_group,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -35,6 +33,7 @@ if TYPE_CHECKING:
 
 FLASH_GEOMETRY = (4096, 2048, 256, 6)
 STARTUP_TIMEOUT = timedelta(minutes=30)
+POLL_SECONDS = 0.001
 
 
 @dataclass(frozen=True)
@@ -51,34 +50,10 @@ class MegaMoEExtraInfo(ConnectorExtraInfo):
 class MegaMoEStage:
     group: Any
     buffer: Any
-    work: ExpertWorkQueue
     sequence: int = 0
     ticket: Any = None
     stream: Any = None
     completion: Any = None
-
-
-class _PublishedWords:
-    """Read local PUBLISHED words without queuing behind an FFN compute stream."""
-
-    def __init__(self, buffer, attention_ranks: int, tp: int):
-        exception_bytes = dict(buffer.layout.sections)["exception"]
-        window = buffer.manager.get_local_buffer_tensor(
-            torch.int32, exception_bytes // 4
-        )
-        # UMDK SplitWord: one 64-byte control row per union rank, PUBLISHED at word 0.
-        self.rows = window[: attention_ranks * 16].view(attention_ranks, 16)
-        self.host = torch.empty(self.rows.shape, dtype=torch.int32, pin_memory=True)
-        self.stream = torch.npu.Stream(device=window.device)
-        self.tp = tp
-
-    def __call__(self) -> list[list[int]]:
-        # Copy contiguous rows with DMA. Strided gathers would launch a device
-        # kernel that could contend with the very fused work we are scheduling.
-        with torch.npu.stream(self.stream):
-            self.host.copy_(self.rows, non_blocking=True)
-        self.stream.synchronize()
-        return self.host[:, 0].reshape(-1, self.tp).tolist()
 
 
 def validate_megamoe_config(config: VllmConfig, afd: AFDConfig) -> None:
@@ -191,12 +166,9 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         )
         self.stages: list[MegaMoEStage] = []
         self.next_stage = 0
-        self.weights: dict[int, LayerWeights] = {}
+        self.layer_ids: list[int] = []
         self.layered_weights: LayerWeights | None = None
         self.layer_slots: dict[int, int] = {}
-        self.layered_gmm_enabled = (
-            afd_config.role == "ffn" and async_cam_layered_gmm_enabled()
-        )
 
     @property
     def is_initialized(self) -> bool:
@@ -210,14 +182,14 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
         ids = [layer.layer_idx for layer in layers]
         if not ids or min(ids) < 0 or len(set(ids)) != len(ids):
             raise ValueError("MegaMoE requires unique nonnegative model layer IDs")
-        self.weights = {
+        weights = {
             layer.layer_idx: expert_weights(
                 layer.mlp, self.role_rank, hf.hidden_size, hf.moe_intermediate_size
             )
             for layer in layers
         }
-        if self.layered_gmm_enabled:
-            self.layered_weights = pack_layer_weights(self.weights)
+        self.layered_weights = pack_layer_weights(weights)
+        self.layer_ids = ids
 
     def init_afd_connector(self) -> None:
         if self.is_initialized:
@@ -244,8 +216,7 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                 store,
                 self.ffn_size,
                 None if attention else self.role_rank,
-                self.layered_gmm_enabled,
-                list(self.weights),
+                self.layer_ids,
             )
             width = (
                 self.vllm_config.parallel_config.tensor_parallel_size
@@ -310,25 +281,12 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
                         hf.hidden_size,
                         hf.moe_intermediate_size,
                         hf.num_experts_per_tok,
+                        attn_ranks_per_dp=self.attn_tp,
                         shared_experts=0,
                         combine_quant_mode=0,
                         activation_parameters=(hf.swiglu_limit, 1.702, 1.0),
                     )
-                lane = MegaMoEStage(
-                    group,
-                    buffer,
-                    ExpertWorkQueue(
-                        dist.PrefixStore(f"stage/{stage}", store),
-                        self.attn_size // self.attn_tp,
-                        self.ffn_size,
-                        ops.split_sequence,
-                        read_published=(
-                            _PublishedWords(buffer, self.attn_size, self.attn_tp)
-                            if dual_stage and not attention
-                            else None
-                        ),
-                    ),
-                )
+                lane = MegaMoEStage(group, buffer)
                 self.stages.append(lane)
                 if dual_stage and not attention:
                     lane.stream = torch.npu.Stream()
@@ -372,8 +330,6 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
 
         lane.ticket = ticket
         lane.sequence = sequence
-        if self.role_rank == members[0]:
-            lane.work.publish(dp, context.metadata.layer_idx, sequence)
 
     def dp_members(self, dp: int) -> list[int]:
         start = dp * self.attn_tp
@@ -398,16 +354,8 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             lane = self.stages[idx]
             if lane.completion is not None and not lane.completion.query():
                 continue
-            item = lane.work.poll(self.role_rank)
-            if item is None:
-                continue
-            dp, layer, sequence = item
-            if self.layered_gmm_enabled:
-                assert self.layered_weights is not None
-                weights = self.layered_weights
-            else:
-                weights = self.weights[layer]
-            args = (*weights, lane.buffer, self.dp_members(dp), sequence)
+            assert self.layered_weights is not None
+            args = (*self.layered_weights, lane.buffer)
             if lane.stream is None:
                 self.ops.megamoe_fused_moe(*args)
                 torch.npu.synchronize()
@@ -438,6 +386,6 @@ class CAMAsyncMegamoeAFDConnector(AFDConnectorBase):
             dist.destroy_process_group(lane.group)
         self.stages.clear()
         self.next_stage = 0
-        self.weights.clear()
+        self.layer_ids.clear()
         self.layered_weights = None
         self.layer_slots.clear()

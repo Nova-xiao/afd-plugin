@@ -51,15 +51,14 @@ kernels are not changed by #601. The runtime pins above are unchanged.
 | Transfer input | BF16 (`dynamicQuant=0`) | Dispatch quantizes BF16 to MXFP8 inside the operator |
 | FFN | CAM receive, native MXFP4 expert MLP, CAM send | One fused receive + expert MLP + send operator |
 | Weights | Native transposed FP4 NZ tensors and E8M0 scales | Output-major FP4 C0=32 storage and E8M0 scales, prepared once after loading |
-| Scheduling | Existing CAM device work selection | Bounded per-DP/per-FFN Store descriptors select layer and generation; tensors travel through MTE |
+| Scheduling | Existing CAM device work selection | The fused operator selects a ready DP and its layer in the stage’s MTE window |
 
 Both use `afd.async=true` and `afd.compute_gate_on_attention=true`. Attention
 DPs can progress independently. Both require eager ModelRunnerV2 for this A5
 path. Use `enable_fused_mc2=0` so native loading retains the tensors consumed by
 these backends. For `CAMAsyncAFDConnector` on A5, leave `AFD_ASYNC_CAM_LAYERED_GMM` disabled:
 the A3 layered INT4/INT8 executor is not the A5 MXFP4 executor. For
-`CAMAsyncMegamoeAFDConnector`, the same FFN-side switch enables device layer
-selection inside the MXFP4 fused operator; see [MegaMoE configuration](MEGAMOE_EAGER.md).
+`CAMAsyncMegamoeAFDConnector`, the MXFP4 fused operator always selects the layer on device; see [MegaMoE configuration](MEGAMOE_EAGER.md).
 
 For ordinary CAM, the BF16 receive scale output is a placeholder. The connector
 now passes `None` to the FFN MLP, causing the native MX method to perform group-32
@@ -69,12 +68,11 @@ perform another EP dispatch. Top-k scaling remains applied once by combine.
 
 For MegaMoE, each ubatch stage owns a communication window and dispatch ticket.
 Within each window, each Attention DP advances the UMDK ring sequence from 1 through 32 and back to 1.
-Every FFN rank consumes the descriptor, including ranks with no selected expert.
+Every FFN rank claims the DP on device, including ranks with no selected expert.
 The kernel's PUBLISHED/TAKEN/READY/CONSUMED protocol protects input/output reuse.
 Each FFN rank admits at most one fused submission per window at a time.
 The validated recipe uses 2A2F. Other A/F counts use DP x TP per role and contiguous static FFN EP in one
-MTE supernode; no graphs, MTP or EPLB. Close the roles together after draining
-requests: communication-window destruction requires the union-group barrier.
+MTE supernode; no graphs, MTP or EPLB. Idle fused kernels wait for new work; stopping a run may require terminating the workers.
 
 ## Operator dependencies and current limits
 
@@ -95,7 +93,7 @@ accuracy, long-run communication and performance checks have not been performed.
   with the ring-sequence Python wrappers is unsupported.
 - MegaMoE's one-time FP4 storage conversion preserves packed nibbles; its
   format-cast and CANN interpretation still need device verification. Local CPU
-  checks establish byte reordering and queue behavior, not numerical support.
+  checks establish byte reordering and layer mapping, not numerical support.
 
 ## Configuration contract
 
@@ -134,7 +132,7 @@ ubatches and native decode/prefill thresholds of at least two tokens.
 For example, use `--dbo-prefill-token-threshold 8 --dbo-decode-token-threshold 2`
 to exercise splitting with eligible requests. Attention dispatches each shard
 into its own registered window and combines it with its own ticket after the
-DBO yield. Each FFN rank polls both stage queues. While one fused kernel is in
+DBO yield. Each FFN rank checks the completion event for each stage. While one fused kernel is in
 flight it can submit work for the other stage on a second NPU stream. An event
 on each stream protects its window until the previous fused kernel completes.
 Both stages use the same expert weights.
