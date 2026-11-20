@@ -20,9 +20,9 @@
 #include "aclnn_cam_megamoe_fused_moe.h"
 
 extern "C" {
-aclnnStatus aclnnCamMegamoeFusedMoeGetWorkspaceSize(const aclTensor *context, const aclTensorList *weight1, const aclTensorList *weight2, const aclTensorList *weight_scales1, const aclTensorList *weight_scales2, const aclIntArray *configuration, const aclIntArray *dp_ranks, const aclFloatArray *activation_parameters, const aclTensor *expert_token_nums, uint64_t *workspaceSize, aclOpExecutor **executor)
+aclnnStatus aclnnCamMegamoeFusedMoeGetWorkspaceSize(const aclTensor *context, const aclTensorList *weight1, const aclTensorList *weight2, const aclTensorList *weight_scales1, const aclTensorList *weight_scales2, const aclIntArray *configuration, const aclFloatArray *activation_parameters, const aclTensor *expert_token_nums, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
-    return aclnnInnerCamMegamoeFusedMoeGetWorkspaceSize(context, weight1, weight2, weight_scales1, weight_scales2, configuration, dp_ranks, activation_parameters, expert_token_nums, workspaceSize, executor);
+    return aclnnInnerCamMegamoeFusedMoeGetWorkspaceSize(context, weight1, weight2, weight_scales1, weight_scales2, configuration, activation_parameters, expert_token_nums, workspaceSize, executor);
 }
 aclnnStatus aclnnCamMegamoeFusedMoe(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
 {

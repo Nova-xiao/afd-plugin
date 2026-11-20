@@ -37,6 +37,7 @@ class SplitBuffer:
         activation_mode=0,
         activation_submode=0,
         activation_parameters=(3.4028234663852886e38, 1.702, 1.0),
+        attn_ranks_per_dp=1,
     ):
         self.rank = distributed.get_rank(group)
         self.layout = SplitLayout(
@@ -49,6 +50,7 @@ class SplitBuffer:
             prefetch,
             combine_quant_mode,
             is_attention=self.rank < attention_ranks,
+            attn_ranks_per_dp=attn_ranks_per_dp,
         )
         if (
             attention_ranks < 1
@@ -118,22 +120,21 @@ class SplitBuffer:
         distributed.barrier(group=group)
 
     def configuration(self, dp_ranks, sequence, tokens):
-        if (
-            not dp_ranks
-            or len(set(dp_ranks)) != len(dp_ranks)
-            or any(rank < 0 or rank >= self.layout.attention_ranks for rank in dp_ranks)
-        ):
-            raise ValueError(
-                "dp_ranks must list the distinct Attention union ranks of one DP"
-            )
+        width = self.layout.attn_ranks_per_dp
+        start = self.rank // width * width
+        if sorted(dp_ranks) != list(range(start, start + width)):
+            raise ValueError("dp_ranks must match this Attention rank's contiguous DP group")
         if not 1 <= sequence <= SPLIT_SEQUENCE_MAX:
             raise ValueError(
                 f"Use consecutive per-DP sequences in [1, {SPLIT_SEQUENCE_MAX}], "
                 "wrapping to 1"
             )
+        return self.launch_configuration(sequence, tokens)
+
+    def launch_configuration(self, sequence_or_dp_width, tokens):
         self.launch = self.launch % SPLIT_SEQUENCE_MAX + 1
         values = self._configuration.copy()
-        values[11], values[13], values[14] = sequence, tokens, self.launch
+        values[11], values[13], values[14] = sequence_or_dp_width, tokens, self.launch
         return values
 
     def destroy(self):
