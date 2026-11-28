@@ -43,7 +43,7 @@ def build_mega_dispatch_payload(
     topk_ids: torch.Tensor,
     layout: CAMDispatchLayout,
 ) -> CAMDispatchPayload:
-    """Pad already-routed local rows; routing belongs to the model adapter."""
+    """Pad already-routed local rows supplied by the Mega MoE runner."""
     tokens = hidden_states.shape[0]
     if topk_weights.shape[0] != tokens or topk_ids.shape != topk_weights.shape:
         raise ValueError("Mega routes must match the local token rows and top-k")

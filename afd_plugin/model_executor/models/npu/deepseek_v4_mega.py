@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""DeepSeek V4 Flash admission, routing and loaded weights for the Mega backend."""
+"""DeepSeek V4 Flash admission and loaded weights for the Mega backend."""
 
 from __future__ import annotations
 
@@ -8,28 +8,15 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.distributed.parallel_state import get_tp_group
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
-from afd_plugin.connectors.npu.async_cam_runtime.async_cam_layout import (
-    CAMDispatchLayout,
-    CAMDispatchPayload,
-)
-from afd_plugin.connectors.npu.async_mega.dispatch import (
-    build_mega_dispatch_payload,
-    plain_tp_layout,
-)
 from afd_plugin.connectors.npu.async_mega.mega_layers import MegaModelSpec
 from afd_plugin.connectors.npu.async_mega.mega_weights import convert_expert_weights
-from afd_plugin.forward_context import get_forward_context
-from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from afd_plugin.connectors.npu.async_mega.mega_layers import LayerWeights
     from afd_plugin.model_executor.models.npu.deepseek_v4 import (
-        AFDDeepseekV4AttentionGateRemoteMoE,
         AFDDeepseekV4DecoderLayer,
     )
 
@@ -101,52 +88,3 @@ def extract_mega_expert_weights(
         owner.w2_weight.data = weights[1][0].transpose(1, 2)
         result[layer.layer_idx] = weights
     return result
-
-
-def build_flash_mega_payload(
-    layer: AFDDeepseekV4AttentionGateRemoteMoE,
-    hidden_states: torch.Tensor,
-    input_ids: torch.Tensor | None,
-    hidden_states_fp32: torch.Tensor | None,
-) -> CAMDispatchPayload:
-    """Preserve local-row routing for plain TP and full-row routing for profiling."""
-    use_sp = layer.use_sequence_parallel_moe
-    tp = get_tp_group() if not use_sp else None
-    parent_tokens = hidden_states.shape[0]
-    if tp is not None and tp.world_size > 1:
-        layout = plain_tp_layout(parent_tokens, tp.rank_in_group, tp.world_size)
-    else:
-        layout = CAMDispatchLayout(
-            parent_tokens=parent_tokens,
-            padded_tokens=parent_tokens,
-            local_token_slice=slice(0, parent_tokens),
-            requires_tp_all_gather=False,
-            use_sequence_parallel=use_sp,
-            tp_rank=0,
-            tp_size=1,
-        )
-    rows = layout.local_token_slice
-    local_routing = layout.requires_tp_all_gather and not _EXTRA_CTX.in_profile_run
-    if local_routing:
-        if layer.gate.tid2eid is not None:
-            if input_ids is None:
-                input_ids = get_forward_context().input_ids
-            input_ids = deepseek_v4_attention_gate.local_hash_input_ids(
-                input_ids=input_ids, router_tokens=parent_tokens
-            )[rows]
-        hidden_states = hidden_states[rows]
-        if hidden_states_fp32 is not None:
-            hidden_states_fp32 = hidden_states_fp32[rows]
-    if local_routing and hidden_states.shape[0] == 0:
-        weights = hidden_states.new_empty((0, layer.top_k), dtype=torch.float32)
-        ids = hidden_states.new_empty((0, layer.top_k), dtype=torch.int32)
-    else:
-        weights, ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            layer,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
-    if not local_routing:
-        hidden_states, weights, ids = hidden_states[rows], weights[rows], ids[rows]
-    return build_mega_dispatch_payload(hidden_states, weights, ids, layout)

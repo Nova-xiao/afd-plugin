@@ -1,7 +1,10 @@
 # DeepSeek-V4-Flash on A5 with asynchronous Mega
 
 The connector is now named `CAMAsyncMegaAFDConnector` and requires
-`afd.async=true`. The work branch is based on upstream `main@e4ddab1`.
+`afd.async=true`. The runner adaptation branch is
+`feature/a5-mega-runner-pr660`, combining Mega `b1503d5b` with
+[PR #660](https://github.com/vllm-project/afd-plugin/pull/660) at
+`67c91e6f721d155999b747cda56f5753328c9a7b` (base `main@fba2e1c`).
 
 See [A5 development notes](A5_DSV4_ASYNC.md) for the pinned vLLM 0.34.0 / Ascend environment,
 operator dependencies, precision/weight handling and configuration contract.
@@ -16,9 +19,12 @@ The model admission entry is `get_mega_model_spec()` in
 `model_executor/models/npu/deepseek_v4_mega.py`.
 The admitted model target remains native FP4 DeepSeek-V4-Flash. Its adapter,
 `deepseek_v4_mega.py`, supplies explicit dimensions and activation parameters,
-extracts native expert parameters, and computes hash/top-k routing. Ordinary
-TP still slices real local tokens **before routing**; profiling and sequence
-parallel retain their existing paths.
+and extracts native expert parameters. The connector registration selects
+`model_executor/ffn/npu/mega.py::AFDAsyncMegaMoERunner` for NPU execution.
+The shared DSV4 MoE model owns the gate, Hash table and shared-expert weights;
+the Mega runner performs routing and orchestrates the remote call. Ordinary TP
+still slices real local tokens **before routing**; profiling routes the full
+input before slicing, and sequence parallel keeps the model's local rows.
 
 The factory uses the standard five-argument connector constructor. Mega resolves
 its `MegaModelSpec` through the model adapter during setup and receives weights
@@ -38,6 +44,51 @@ weight-extraction test checks native axes and shared converted storage; it
 substitutes device format casting and makes no NPU accuracy claim. The existing
 local-row routing regression also checks hash IDs, FP32 inputs and empty TP
 shards. A5 end-to-end validation remains required after this Python refactor.
+
+## PR #660 runner adaptation
+
+The runner uses the shared NPU gate selector with the model's FP32 gate input
+and loaded Hash table. It preserves Mega's zero-weight padding with distinct
+valid expert IDs, including a TP rank with no real tokens. It sends through
+Mega's existing receive closure, runs shared experts, yields for DBO, receives
+on the original stage, restores the TP/SP layout and adds shared output once.
+The connector retains its shared-window receive hook, sequence ring and single
+FFN lane. Native operator sources and weight conversion are unchanged.
+
+The migrated regression is
+`tests/unit/model_executor/models/test_mega_moe_runner.py`. It constructs the
+registered runner through the real vLLM factory on CPU and covers weightless
+expert post-loading, TP routing, Hash IDs, FP32 inputs, profiling, SP, padding,
+and stage ownership across yield. Existing connector tests cover tickets,
+window reuse and FFN lifecycle separately. CPU stand-ins do not validate NPU
+kernel execution or stream ordering.
+
+Local validation on 2026-11-28 used Python 3.12.16, Torch 2.15.0 and the vLLM
+0.34.0 source package on a CPU host without vLLM-Ascend. The CI host selection
+below passed: **2,083 passed, 58 skipped, 14 deselected**, with 41 subtests
+passed. Local TCP/HTTP tests require permission to bind loopback sockets.
+Mega changes also passed mypy 1.11.1 (Python 3.11 target), Ruff 0.15.13,
+typos 1.49.0 and SPDX checks. A5 runtime validation is pending.
+
+```bash
+python -m pytest -q -o addopts='' -m 'not gpu and not vllm_runtime' \
+  tests/unit tests/npu/test_afd_async_harness.py \
+  tests/npu/test_afd_async_performance.py tests/npu/test_afd_async_golden.py \
+  tests/npu/test_gmm_layered_performance.py
+```
+
+PR #660 reports A3 serving and accuracy results at `6899fff`, before subsequent
+module refactors. At the pinned `67c91e6`, its pre-commit check passed but the
+Buildkite `ready / Simple · Unit Test` check failed when inspected on 2026-11-28.
+Its reported A3 results do not validate this A5 Mega adaptation. If #660 changes,
+compare its runner factory, gate and model-forward interfaces with this pinned
+commit before updating the adaptation branch.
+
+For A5 validation, retain the existing environment and launch configuration.
+Run the same accuracy workload with TP1 and TP2, DBO off/on, and FlashComm1
+off/on where supported. Include uneven token counts and profile startup;
+verify progress, output accuracy, and the existing greater-than-96-call ring
+exercise. Compare prefill throughput and TTFT with `b1503d5b` on the same setup.
 
 ## Bundled operator protocol
 
@@ -137,6 +188,7 @@ python -m pytest -q tests/unit/connectors/npu/async_mega \
   tests/unit/connectors/npu/test_mega_layers.py \
   tests/unit/connectors/npu/test_mega_topology.py \
   tests/unit/model_executor/npu/test_mega_weights.py \
+  tests/unit/model_executor/models/test_mega_moe_runner.py \
   tests/unit/v1/worker/npu/test_async_mega_ffn_model_runner.py
 ```
 
